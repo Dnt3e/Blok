@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: blok_db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASS}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASS}
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./backups:/backups
+    ports:
+      - "3306:3306"
+    networks:
+      - blok_network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: blok_backend
+    depends_on:
+      - db
+    environment:
+      DB_URI: mysql://${DB_USER}:${DB_PASS}@db:3306/${DB_NAME}
+      JWT_SECRET: ${JWT_SECRET}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./backend:/app
+      - ./bin:/app/bin
+      - ./configs:/app/configs
+    networks:
+      - blok_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: blok_frontend
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./frontend:/app
+    networks:
+      - blok_network
+
+volumes:
+  db_data:
+
+networks:
+  blok_network:
+    driver: bridge
