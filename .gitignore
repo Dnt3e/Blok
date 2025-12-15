@@ -1,5 +1,7 @@
 venv/
-data/session
-data/downloads/
-data/*.json
+downloads/
+users.json
+state.json
+config.json
+session
 __pycache__/
