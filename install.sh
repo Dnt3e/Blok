@@ -23,15 +23,19 @@ if [ "$C" == "1" ]; then
 
 cat <<'PYCODE' > telegram_instabot.py
 #!/usr/bin/env python3
-import os, json, requests, hashlib
+import os, json, asyncio, requests, hashlib
 from pathlib import Path
 from datetime import datetime
 import instaloader
 from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-# ---------- Paths ----------
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters
+)
+
+# ---------------- Paths ----------------
 BASE = Path(__file__).parent
 DOWNLOADS = BASE / "downloads"
 CONFIG = BASE / "config.json"
@@ -51,31 +55,44 @@ ADMIN_ID = str(cfg["admin_id"])
 users = json.loads(USERS.read_text())
 state = json.loads(STATE.read_text())
 
-# ---------- Instagram ----------
-L = instaloader.Instaloader(save_metadata=False, download_comments=False, dirname_pattern=str(DOWNLOADS / "{target}"))
-if SESSION.exists():
-    try: L.load_session_from_file(filename=str(SESSION))
-    except: pass
+# ---------------- Instagram ----------------
+L = instaloader.Instaloader(
+    save_metadata=False,
+    download_comments=False,
+    dirname_pattern=str(DOWNLOADS / "{target}")
+)
 
-# ---------- Utils ----------
+if SESSION.exists():
+    try:
+        L.load_session_from_file(filename=str(SESSION))
+    except:
+        pass
+
+# ---------------- Utils ----------------
 def save():
     USERS.write_text(json.dumps(users, indent=2))
     STATE.write_text(json.dumps(state, indent=2))
 
 def ensure(uid):
     if uid not in users:
-        users[uid] = {"role":"admin" if uid==ADMIN_ID else "user","blocked":False,"accounts":[],"language":"en"}
+        users[uid] = {
+            "role": "admin" if uid == ADMIN_ID else "user",
+            "blocked": False,
+            "accounts": [],
+            "interval": 30,   # minutes
+            "auto": False
+        }
         save()
 
-def admin(uid): return users.get(uid, {}).get("role")=="admin"
+def admin(uid): return users.get(uid, {}).get("role") == "admin"
 def blocked(uid): return users.get(uid, {}).get("blocked", False)
 
-async def send_file(p, chat, ctx, caption=""):
-    with open(p,"rb") as f:
-        await ctx.bot.send_document(chat,f,caption=caption)
-    os.remove(p)
+async def send_file(path, chat_id, ctx, caption=""):
+    with open(path, "rb") as f:
+        await ctx.bot.send_document(chat_id, f, caption=caption)
+    os.remove(path)
 
-# ---------- Story Scraper ----------
+# ---------------- Story Sites ----------------
 STORY_SITES = [
     lambda u: f"https://insta-stories-viewer.com/{u}/",
     lambda u: f"https://storiesig.info/en/{u}",
@@ -83,142 +100,157 @@ STORY_SITES = [
 ]
 
 async def fetch_story_sites(username, chat_id, ctx):
-    headers={"User-Agent":"Mozilla/5.0"}
-    sent_files=set()
+    headers = {"User-Agent": "Mozilla/5.0"}
+    sent = False
+
     for site in STORY_SITES:
         try:
-            r=requests.get(site(username), headers=headers, timeout=15)
-            soup=BeautifulSoup(r.text,"html.parser")
-            urls=set()
+            r = requests.get(site(username), headers=headers, timeout=15)
+            soup = BeautifulSoup(r.text, "html.parser")
+            urls = set()
 
             for v in soup.find_all("video"):
                 if v.get("src"): urls.add(v["src"])
             for i in soup.find_all("img"):
-                if i.get("src") and "cdn" in i["src"]: urls.add(i["src"])
+                if i.get("src") and "cdn" in i["src"]:
+                    urls.add(i["src"])
 
-            for u in urls:
-                # جلوگیری از تکراری
-                h=hashlib.md5(u.encode()).hexdigest()
-                if h in sent_files: continue
-                ext=".mp4" if ".mp4" in u else ".jpg"
-                p=DOWNLOADS/f"{username}_{h}{ext}"
-                with open(p,"wb") as f: f.write(requests.get(u,headers=headers).content)
-                await send_file(p,chat_id,ctx,caption=f"Story from @{username}")
-                sent_files.add(h)
+            for url in urls:
+                h = hashlib.md5(url.encode()).hexdigest()
+                if state.get(h): continue
 
-            if sent_files: return
-        except: pass
+                ext = ".mp4" if ".mp4" in url else ".jpg"
+                p = DOWNLOADS / f"{username}_{h}{ext}"
 
-    if not sent_files:
-        await ctx.bot.send_message(chat_id,"⚠️ No public stories found")
+                with open(p, "wb") as f:
+                    f.write(requests.get(url, headers=headers).content)
 
-# ---------- Menu ----------
+                await send_file(p, chat_id, ctx, f"📖 Story @{username}")
+                state[h] = True
+                sent = True
+
+            if sent:
+                save()
+                return
+        except:
+            continue
+
+    if not sent:
+        await ctx.bot.send_message(chat_id, "⚠️ No public stories found")
+
+# ---------------- Menu ----------------
 def menu(uid):
-    b=[
-        [InlineKeyboardButton("➕ Add Account",callback_data="add")],
-        [InlineKeyboardButton("⬇️ Fetch",callback_data="fetch")],
-        [InlineKeyboardButton("🔗 Link",callback_data="link")]
+    buttons = [
+        [InlineKeyboardButton("➕ Add Account", callback_data="add")],
+        [InlineKeyboardButton("⬇️ Fetch Now", callback_data="fetch")],
+        [InlineKeyboardButton("⏱ Set Interval", callback_data="interval")],
+        [InlineKeyboardButton("▶️ Start Auto", callback_data="auto_on"),
+         InlineKeyboardButton("⏹ Stop Auto", callback_data="auto_off")]
     ]
     if admin(uid):
-        b.append([InlineKeyboardButton("🔐 Upload Session",callback_data="session")])
-        b.append([InlineKeyboardButton("👥 Users",callback_data="users")])
-    return InlineKeyboardMarkup(b)
+        buttons.append([InlineKeyboardButton("🔐 Upload Session", callback_data="session")])
+        buttons.append([InlineKeyboardButton("👥 Users", callback_data="users")])
+    return InlineKeyboardMarkup(buttons)
 
-# ---------- Handlers ----------
-async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    uid=str(update.effective_user.id); ensure(uid)
-    await update.message.reply_text("🤖 Bot Ready",reply_markup=menu(uid))
+# ---------------- Handlers ----------------
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    ensure(uid)
+    await update.message.reply_text("🤖 Bot Ready", reply_markup=menu(uid))
 
-async def cb(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; await q.answer()
-    uid=str(q.from_user.id); ensure(uid)
+async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = str(q.from_user.id)
+    ensure(uid)
 
-    if q.data=="add":
-        ctx.user_data["await"]="add"; await q.edit_message_text("Send Instagram username:")
-    elif q.data=="fetch":
-        await q.edit_message_text("Checking...")
+    if q.data == "add":
+        ctx.user_data["await"] = "add"
+        await q.edit_message_text("Send Instagram username")
+    elif q.data == "fetch":
         for a in users[uid]["accounts"]:
-            await fetch_account(a,q.message.chat_id,ctx)
-        await q.edit_message_text("Done",reply_markup=menu(uid))
-    elif q.data=="link":
-        ctx.user_data["await"]="link"; await q.edit_message_text("Send Instagram link:")
-    elif q.data=="session" and admin(uid):
-        ctx.user_data["await"]="session"; await q.edit_message_text("Send session file:")
-    elif q.data=="users" and admin(uid):
-        txt="\n".join(f"{u} | {d['role']} | blocked={d['blocked']}" for u,d in users.items())
-        await q.edit_message_text(txt)
+            await fetch_account(a, q.message.chat_id, ctx)
+        await q.edit_message_text("✅ Done", reply_markup=menu(uid))
+    elif q.data == "interval":
+        ctx.user_data["await"] = "interval"
+        await q.edit_message_text("Send interval in minutes (e.g. 30)")
+    elif q.data == "auto_on":
+        users[uid]["auto"] = True
+        save()
+        await q.edit_message_text("▶️ Auto fetch enabled", reply_markup=menu(uid))
+    elif q.data == "auto_off":
+        users[uid]["auto"] = False
+        save()
+        await q.edit_message_text("⏹ Auto fetch disabled", reply_markup=menu(uid))
+    elif q.data == "session" and admin(uid):
+        ctx.user_data["await"] = "session"
+        await q.edit_message_text("Send Instagram session file")
 
-async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    uid=str(update.effective_user.id); ensure(uid)
-    if ctx.user_data.get("await")=="add":
-        users[uid]["accounts"].append(update.message.text.strip().replace("@",""))
-        save(); ctx.user_data.clear()
-        await update.message.reply_text("Added",reply_markup=menu(uid))
-    elif ctx.user_data.get("await")=="link":
+async def text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    ensure(uid)
+    txt = update.message.text.strip()
+
+    if ctx.user_data.get("await") == "add":
+        users[uid]["accounts"].append(txt.replace("@",""))
+        save()
         ctx.user_data.clear()
-        await fetch_link(update.message.text.strip(),update.message.chat_id,ctx)
+        await update.message.reply_text("✅ Added", reply_markup=menu(uid))
 
-async def receive_session(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    uid=str(update.effective_user.id)
+    elif ctx.user_data.get("await") == "interval":
+        users[uid]["interval"] = int(txt)
+        save()
+        ctx.user_data.clear()
+        await update.message.reply_text("⏱ Interval updated", reply_markup=menu(uid))
+
+async def receive_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
     if not admin(uid): return
-    if ctx.user_data.get("await")!="session": return
-    doc=update.message.document
-    if not doc: return
-    file=await doc.get_file()
+    doc = update.message.document
+    file = await doc.get_file()
     await file.download_to_drive(SESSION)
     L.load_session_from_file(filename=str(SESSION))
-    ctx.user_data.clear()
     await update.message.reply_text("✅ Session loaded")
 
-# ---------- Fetch ----------
-async def fetch_account(username,chat_id,ctx):
-    # Posts/Reels
-    try: p=instaloader.Profile.from_username(L.context,username)
-    except: return
-    last=state.get(username,{})
-
-    for post in p.get_posts():
-        if last.get("post") and post.date_utc<=datetime.fromisoformat(last["post"]): continue
-        L.download_post(post,target=username)
-        for r,_,f in os.walk(DOWNLOADS/username):
-            for x in f: await send_file(os.path.join(r,x),chat_id,ctx,caption=f"@{username}")
-        last["post"]=post.date_utc.isoformat()
-        break
-
-    state[username]=last
-    save()
-    # Stories
-    await fetch_story_sites(username,chat_id,ctx)
-
-async def fetch_link(url,chat_id,ctx):
+# ---------------- Fetch ----------------
+async def fetch_account(username, chat_id, ctx):
     try:
-        if "/p/" in url or "/reel/" in url:
-            c=url.rstrip("/").split("/")[-1]
-            L.download_post(instaloader.Post.from_shortcode(L.context,c),"link")
-            for r,_,f in os.walk(DOWNLOADS/"link"):
-                for x in f: await send_file(os.path.join(r,x),chat_id,ctx)
-        elif "/stories/" in url:
-            u=url.split("/stories/")[1].split("/")[0]
-            await fetch_story_sites(u,chat_id,ctx)
-    except Exception as e:
-        await ctx.bot.send_message(chat_id,str(e))
+        p = instaloader.Profile.from_username(L.context, username)
+    except:
+        return
 
-# ---------- Main ----------
+    await fetch_story_sites(username, chat_id, ctx)
+
+# ---------------- Scheduler ----------------
+async def scheduler(app):
+    while True:
+        for uid, u in users.items():
+            if not u.get("auto"): continue
+            for acc in u["accounts"]:
+                try:
+                    await fetch_account(acc, int(uid), app.bot)
+                except:
+                    pass
+        await asyncio.sleep(60)
+
+# ---------------- Main ----------------
 def main():
-    app=ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",start))
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(cb))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text))
-    app.add_handler(MessageHandler(filters.Document.ALL,receive_session))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text))
+    app.add_handler(MessageHandler(filters.Document.ALL, receive_session))
+    app.create_task(scheduler(app))
     app.run_polling()
 
-if __name__=="__main__": main()
+if __name__ == "__main__":
+    main()
 PYCODE
 
 cat <<EOF > config.json
 {
-  "bot_token":"$BOT_TOKEN",
-  "admin_id":$ADMIN_ID
+  "bot_token": "$BOT_TOKEN",
+  "admin_id": $ADMIN_ID
 }
 EOF
 
@@ -231,11 +263,12 @@ sudo tee /etc/systemd/system/$SERVICE.service >/dev/null <<EOF
 [Unit]
 Description=Instagram Bot
 After=network.target
+
 [Service]
 WorkingDirectory=$PROJECT
 ExecStart=$PROJECT/venv/bin/python telegram_instabot.py
 Restart=always
-RestartSec=5
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -243,18 +276,5 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable $SERVICE
 sudo systemctl start $SERVICE
-echo "✅ Bot Installed and Running"
+echo "✅ Bot installed and running"
 fi
-
-if [ "$C" == "2" ]; then
-    sudo systemctl stop $SERVICE || true
-    sudo systemctl disable $SERVICE || true
-    sudo rm -f /etc/systemd/system/$SERVICE.service
-    sudo systemctl daemon-reload
-    rm -rf "$PROJECT"
-    echo "✅ Bot removed"
-fi
-
-if [ "$C" == "3" ]; then sudo systemctl start $SERVICE; fi
-if [ "$C" == "4" ]; then sudo systemctl restart $SERVICE; fi
-if [ "$C" == "5" ]; then sudo systemctl status $SERVICE; fi
