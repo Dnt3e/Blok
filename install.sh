@@ -24,12 +24,12 @@ if [ "$C" == "1" ]; then
     # ---------- telegram_instabot.py ----------
     cat <<'PYCODE' > telegram_instabot.py
 #!/usr/bin/env python3
-import os, json, asyncio
+import os, json, asyncio, requests
 from pathlib import Path
 from datetime import datetime
-import instaloader
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+import instaloader
 
 # ---------- Paths ----------
 BASE = Path(__file__).parent
@@ -182,21 +182,17 @@ async def fetch_account(username, chat_id, ctx):
         for r, _, f in os.walk(DOWNLOADS/username):
             for x in f: await send_file(os.path.join(r,x), chat_id, ctx)
         last["post"] = post.date_utc.isoformat()
-    # Stories via public API site fallback
-    found=False
+    # Stories (public fallback)
     try:
-        if L.context.is_logged_in:
-            for story in instaloader.get_stories([p.userid], L.context):
-                for item in story.get_items():
-                    if last.get("story") and item.date_utc <= datetime.fromisoformat(last["story"]): continue
-                    L.download_storyitem(item, target=username)
-                    found=True
-                    for r,_,f in os.walk(DOWNLOADS/username):
-                        for x in f: await send_file(os.path.join(r,x), chat_id, ctx)
-                    last["story"]=item.date_utc.isoformat()
-    except: pass
-    if not found:
-        await ctx.bot.send_message(chat_id,"⚠️ No active stories found or login required")
+        stories = get_public_stories(username)
+        if stories:
+            for url in stories:
+                path = download_file(url, DOWNLOADS/username)
+                await send_file(path, chat_id, ctx)
+        else:
+            await ctx.bot.send_message(chat_id,"⚠️ No active public stories found")
+    except Exception as e:
+        await ctx.bot.send_message(chat_id,f"Error fetching stories: {e}")
     state[username]=last
     save()
 
@@ -207,13 +203,14 @@ async def fetch_link(url, chat_id, ctx):
             c = url.rstrip("/").split("/")[-1]
             L.download_post(instaloader.Post.from_shortcode(L.context, c), target="link")
         elif "/stories/" in url:
-            if not L.context.is_logged_in:
-                await ctx.bot.send_message(chat_id, "Login required")
-                return
             u = url.split("/stories/")[1].split("/")[0]
-            p = instaloader.Profile.from_username(L.context,u)
-            for s in instaloader.get_stories([p.userid], L.context):
-                for i in s.get_items(): L.download_storyitem(i,target="link")
+            stories = get_public_stories(u)
+            if not stories:
+                await ctx.bot.send_message(chat_id,"⚠️ No public stories found")
+                return
+            for s in stories:
+                path = download_file(s, d)
+                await send_file(path, chat_id, ctx)
         else:
             await ctx.bot.send_message(chat_id, "Unsupported link")
             return
@@ -224,6 +221,25 @@ async def fetch_link(url, chat_id, ctx):
         if not sent: await ctx.bot.send_message(chat_id,"Nothing downloaded")
     except Exception as e:
         await ctx.bot.send_message(chat_id,f"Error: {e}")
+
+# ---------- Public Story Downloader ----------
+def get_public_stories(username):
+    try:
+        r = requests.get(f"https://storiesig.com/stories/{username}")
+        if r.status_code != 200: return []
+        data = r.json()  # فرض بر json response سایت
+        return [item["media_url"] for item in data.get("stories",[])]
+    except:
+        return []
+
+def download_file(url, folder):
+    folder.mkdir(exist_ok=True)
+    local = folder / url.split("/")[-1]
+    r = requests.get(url, stream=True)
+    with open(local, "wb") as f:
+        for chunk in r.iter_content(1024):
+            f.write(chunk)
+    return local
 
 # ---------- Main ----------
 def main():
@@ -249,7 +265,7 @@ EOF
     python3 -m venv venv
     source venv/bin/activate
     pip install --upgrade pip
-    pip install python-telegram-bot==22.3 instaloader
+    pip install python-telegram-bot==22.3 instaloader requests
 
     # ---------- systemd service ----------
     sudo tee /etc/systemd/system/$SERVICE.service > /dev/null <<EOF
