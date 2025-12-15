@@ -1,0 +1,5 @@
+venv/
+data/session
+data/downloads/
+data/*.json
+__pycache__/
