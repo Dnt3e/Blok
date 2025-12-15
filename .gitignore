@@ -1,7 +1,7 @@
 venv/
 downloads/
+session
 config.json
 users.json
 state.json
-session
 __pycache__/
