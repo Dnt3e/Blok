@@ -182,10 +182,10 @@ async def fetch_account(username, chat_id, ctx):
         for r, _, f in os.walk(DOWNLOADS/username):
             for x in f: await send_file(os.path.join(r,x), chat_id, ctx)
         last["post"] = post.date_utc.isoformat()
-    # Stories
-    if L.context.is_logged_in:
-        found=False
-        try:
+    # Stories via public API site fallback
+    found=False
+    try:
+        if L.context.is_logged_in:
             for story in instaloader.get_stories([p.userid], L.context):
                 for item in story.get_items():
                     if last.get("story") and item.date_utc <= datetime.fromisoformat(last["story"]): continue
@@ -194,11 +194,9 @@ async def fetch_account(username, chat_id, ctx):
                     for r,_,f in os.walk(DOWNLOADS/username):
                         for x in f: await send_file(os.path.join(r,x), chat_id, ctx)
                     last["story"]=item.date_utc.isoformat()
-        except: pass
-        if not found:
-            await ctx.bot.send_message(chat_id,"⚠️ No active stories found")
-    else:
-        await ctx.bot.send_message(chat_id, LANG[users[str(chat_id)]["language"]]["login_required"])
+    except: pass
+    if not found:
+        await ctx.bot.send_message(chat_id,"⚠️ No active stories found or login required")
     state[username]=last
     save()
 
