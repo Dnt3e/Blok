@@ -1,254 +1,290 @@
 #!/bin/bash
 set -e
 
-echo "===================================="
-echo " Telegram Instagram Bot Installer"
-echo "===================================="
+PROJECT="$HOME/Blok"
+SERVICE="insta_bot"
 
-# --- دریافت اطلاعات اولیه ---
-read -p "Enter Telegram Bot Token: " BOT_TOKEN
-read -p "Enter Admin Telegram User ID: " ADMIN_ID
-read -p "Enter Auto-Check Interval (hours, e.g., 1): " AUTO_INTERVAL
+echo "1) Install Bot"
+echo "2) Remove Bot completely"
+echo "3) Start Bot"
+echo "4) Restart Bot"
+echo "5) Status Bot"
+read -p "Choose option [1-5]: " C
 
-APP_DIR="$HOME/Blok"
-PYTHON_BIN="/usr/bin/python3"
+if [ "$C" == "1" ]; then
+    read -p "Telegram Bot Token: " BOT_TOKEN
+    read -p "Telegram Admin ID: " ADMIN_ID
 
-echo "[1/10] Creating project directory..."
-mkdir -p "$APP_DIR"
-cd "$APP_DIR"
+    sudo apt update
+    sudo apt install -y python3 python3-venv python3-pip
 
-echo "[2/10] Creating virtual environment..."
-$PYTHON_BIN -m venv venv
-source venv/bin/activate
+    mkdir -p "$PROJECT"
+    cd "$PROJECT"
 
-echo "[3/10] Installing Python packages..."
-pip install --upgrade pip
-pip install python-telegram-bot==22.3 instaloader nest_asyncio apscheduler
-
-echo "[4/10] Creating downloads folder..."
-mkdir -p downloads
-
-echo "[5/10] Writing bot source code..."
-cat > telegram_instabot.py <<EOF
-import asyncio, os, logging, nest_asyncio, instaloader
+    # ---------- telegram_instabot.py ----------
+    cat <<'PYCODE' > telegram_instabot.py
+#!/usr/bin/env python3
+import os, json, asyncio
+from pathlib import Path
+from datetime import datetime
+import instaloader
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import *
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-nest_asyncio.apply()
+# ---------- Paths ----------
+BASE = Path(__file__).parent
+DOWNLOADS = BASE / "downloads"
+CONFIG = BASE / "config.json"
+USERS = BASE / "users.json"
+STATE = BASE / "state.json"
+SESSION = BASE / "session"
 
-BOT_TOKEN = "${BOT_TOKEN}"
-ADMIN_ID = int("${ADMIN_ID}")
-AUTO_INTERVAL = ${AUTO_INTERVAL}
+DOWNLOADS.mkdir(exist_ok=True)
+for f, d in [(USERS, {}), (STATE, {})]:
+    if not f.exists():
+        f.write_text(json.dumps(d))
 
-SESSION_FILE = "ig.session"
-DOWNLOAD_DIR = "downloads"
-USERS_FILE = "users.db"
+if not CONFIG.exists():
+    print("config.json not found")
+    exit(1)
 
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+cfg = json.loads(CONFIG.read_text())
+BOT_TOKEN = cfg["bot_token"]
+ADMIN_ID = str(cfg["admin_id"])
 
-logging.basicConfig(level=logging.INFO)
-L = instaloader.Instaloader(dirname_pattern=DOWNLOAD_DIR)
-scheduler = AsyncIOScheduler()
-scheduler.start()
+users = json.loads(USERS.read_text())
+state = json.loads(STATE.read_text())
 
-# ---------- USERS ----------
-def load_users():
-    if not os.path.exists(USERS_FILE):
-        return {}
-    return eval(open(USERS_FILE).read())
+# ---------- Instagram Loader ----------
+L = instaloader.Instaloader(save_metadata=False, download_comments=False, dirname_pattern=str(DOWNLOADS / "{target}"))
+if SESSION.exists():
+    try: L.load_session_from_file(filename=str(SESSION))
+    except: pass
 
-def save_users(u): open(USERS_FILE,"w").write(str(u))
+# ---------- Utility ----------
+def save():
+    USERS.write_text(json.dumps(users, indent=2))
+    STATE.write_text(json.dumps(state, indent=2))
 
-users = load_users()
-
-def is_admin(uid): return uid == ADMIN_ID
-
-def ensure_user(uid):
+def ensure(uid):
     if uid not in users:
-        users[uid] = {"lang":"EN","limit":20,"followed":[],"interval":AUTO_INTERVAL}
-        save_users(users)
+        users[uid] = {"role": "admin" if uid == ADMIN_ID else "user", "blocked": False, "accounts": [], "language":"en","interval":1}
+        save()
 
-# ---------- SESSION ----------
-def session_ok():
-    try:
-        L.load_session_from_file(SESSION_FILE)
-        return True
-    except: return False
+def admin(uid): return users.get(uid, {}).get("role") == "admin"
+def blocked(uid): return users.get(uid, {}).get("blocked", False)
 
-# ---------- UI ----------
-def main_menu(lang):
-    if lang=="FA":
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📥 دانلود لینک",callback_data="dl")],
-            [InlineKeyboardButton("📖 استوری",callback_data="story")],
-            [InlineKeyboardButton("⚙ تنظیمات",callback_data="settings")]
-        ])
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 Download Link",callback_data="dl")],
-        [InlineKeyboardButton("📖 Stories",callback_data="story")],
-        [InlineKeyboardButton("⚙ Settings",callback_data="settings")]
-    ])
+async def send_file(p, chat, ctx):
+    with open(p, "rb") as f:
+        await ctx.bot.send_document(chat, f)
+    os.remove(p)
 
-# ---------- COMMANDS ----------
-async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_user.id
-    ensure_user(uid)
-    await update.message.reply_text(
-        "✅ Bot Ready",
-        reply_markup=main_menu(users[uid]["lang"])
-    )
+# ---------- Language ----------
+LANG = {
+    "fa":{"start":"🤖 ربات آماده است","add":"➕ افزودن اکانت","fetch":"⬇️ بررسی جدیدها","link":"🔗 دانلود با لینک","login_required":"❌ برای استوری باید session آپلود شود"},
+    "en":{"start":"🤖 Bot is ready","add":"➕ Add Account","fetch":"⬇️ Check New","link":"🔗 Download by Link","login_required":"❌ Instagram session required for stories"}
+}
 
-# ---------- BUTTONS ----------
-async def buttons(update:Update,ctx):
-    q=update.callback_query
-    uid=q.from_user.id
-    ensure_user(uid)
+def menu(is_admin=False, lang="en"):
+    buttons = [
+        [InlineKeyboardButton(LANG[lang]["add"], callback_data="add")],
+        [InlineKeyboardButton(LANG[lang]["fetch"], callback_data="fetch")],
+        [InlineKeyboardButton(LANG[lang]["link"], callback_data="link")]
+    ]
+    if is_admin:
+        buttons.append([InlineKeyboardButton("🔐 Upload IG Session", callback_data="upload_session")])
+        buttons.append([InlineKeyboardButton("👥 Users", callback_data="users")])
+    return InlineKeyboardMarkup(buttons)
+
+# ---------- Bot Handlers ----------
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    ensure(uid)
+    if blocked(uid): return
+    lang = users[uid]["language"]
+    await update.message.reply_text(LANG[lang]["start"], reply_markup=menu(admin(uid), lang))
+
+async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
     await q.answer()
+    uid = str(q.from_user.id)
+    ensure(uid)
+    if blocked(uid): return
+    lang = users[uid]["language"]
 
-    if q.data=="dl":
-        await q.message.reply_text("Send Instagram link")
-    elif q.data=="story":
-        if not session_ok():
-            await q.message.reply_text("❌ Instagram session required for stories")
-            return
-        await q.message.reply_text("Send Instagram username")
-    elif q.data=="settings":
-        kb=[[InlineKeyboardButton("🌐 Language",callback_data="lang")]]
-        if is_admin(uid):
-            kb.append([InlineKeyboardButton("🔐 Upload Session",callback_data="upload")])
-            kb.append([InlineKeyboardButton("🩺 Session Health",callback_data="health")])
-            kb.append([InlineKeyboardButton("🗂 Manage Followed Accounts",callback_data="followed")])
-            kb.append([InlineKeyboardButton("⏱ Set Auto-Check Interval",callback_data="interval")])
-        kb.append([InlineKeyboardButton("◀ Back", callback_data="back")])
-        await q.message.reply_text("Settings",reply_markup=InlineKeyboardMarkup(kb))
-    elif q.data=="lang":
-        users[uid]["lang"]="FA" if users[uid]["lang"]=="EN" else "EN"
-        save_users(users)
-        await q.message.reply_text("Language changed")
-    elif q.data=="health":
-        await q.message.reply_text("✅ Session OK" if session_ok() else "❌ Invalid session")
-    elif q.data=="upload":
-        await q.message.reply_text("Send session file")
-    elif q.data=="followed":
-        await q.message.reply_text(
-            "Commands:\n/add username\n/remove username\n/list",
-        )
-    elif q.data=="interval":
-        await q.message.reply_text("Send new interval in hours")
-    elif q.data=="back":
-        await q.message.reply_text("Main Menu",reply_markup=main_menu(users[uid]["lang"]))
+    if q.data == "add":
+        ctx.user_data["await"] = "add"
+        await q.edit_message_text("Send Instagram username")
+    elif q.data == "fetch":
+        await q.edit_message_text("Checking...")
+        for a in users[uid]["accounts"]:
+            await fetch_account(a, q.message.chat_id, ctx)
+        await q.edit_message_text("Done", reply_markup=menu(admin(uid), lang))
+    elif q.data == "link":
+        ctx.user_data["await"] = "link"
+        await q.edit_message_text("Send link")
+    elif q.data == "upload_session" and admin(uid):
+        ctx.user_data["await"] = "session"
+        await q.edit_message_text("📤 Please send Instagram session file (session-USERNAME)")
+    elif q.data == "users" and admin(uid):
+        txt = "\n".join(f"{u} | {d['role']} | blocked={d['blocked']}" for u,d in users.items())
+        await q.edit_message_text(txt)
 
-# ---------- HANDLERS ----------
-async def handle_doc(update:Update,ctx):
-    if not is_admin(update.effective_user.id): return
-    doc=update.message.document
-    if "session" in doc.file_name:
-        await doc.get_file().download_to_drive(SESSION_FILE)
-        await update.message.reply_text("✅ Session uploaded")
+async def text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    ensure(uid)
+    if blocked(uid): return
+    t = update.message.text.strip()
 
-async def handle_text(update:Update,ctx):
-    uid=update.effective_user.id
-    ensure_user(uid)
-    txt=update.message.text.strip()
+    if ctx.user_data.get("await") == "add":
+        users[uid]["accounts"].append(t.replace("@",""))
+        save()
+        ctx.user_data["await"] = None
+        await update.message.reply_text("Added", reply_markup=menu(admin(uid), users[uid]["language"]))
 
-    # Followed accounts management
-    if is_admin(uid):
-        if txt.startswith("/add "):
-            usern=txt.split(" ",1)[1]
-            if usern not in users[uid]["followed"]:
-                users[uid]["followed"].append(usern)
-                save_users(users)
-                await update.message.reply_text(f"✅ Added {usern}")
-            return
-        if txt.startswith("/remove "):
-            usern=txt.split(" ",1)[1]
-            if usern in users[uid]["followed"]:
-                users[uid]["followed"].remove(usern)
-                save_users(users)
-                await update.message.reply_text(f"✅ Removed {usern}")
-            return
-        if txt=="/list":
-            await update.message.reply_text("Followed: "+", ".join(users[uid]["followed"]))
-            return
-        if txt.isdigit():
-            users[uid]["interval"]=int(txt)
-            scheduler.remove_all_jobs()
-            scheduler.add_job(auto_check,'interval',hours=int(txt))
-            save_users(users)
-            await update.message.reply_text(f"✅ Interval set to {txt} hours")
-            return
+    elif ctx.user_data.get("await") == "link":
+        ctx.user_data["await"] = None
+        await fetch_link(t, update.message.chat_id, ctx)
+        await update.message.reply_text("Done", reply_markup=menu(admin(uid), users[uid]["language"]))
 
-    # Instagram link
-    if "instagram.com" in txt:
+async def receive_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if not admin(uid): return
+    if ctx.user_data.get("await") != "session": return
+
+    doc = update.message.document
+    if not doc:
+        await update.message.reply_text("❌ Please send a file")
+        return
+    if not doc.file_name.startswith("session-"):
+        await update.message.reply_text("❌ Invalid session file name")
+        return
+
+    file = await doc.get_file()
+    await file.download_to_drive(custom_path=str(SESSION))
+    try:
+        L.load_session_from_file(filename=str(SESSION))
+        ctx.user_data["await"] = None
+        await update.message.reply_text("✅ Instagram session loaded successfully")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to load session\n{e}")
+
+# ---------- Fetch functions ----------
+async def fetch_account(username, chat_id, ctx):
+    try: p = instaloader.Profile.from_username(L.context, username)
+    except: return
+
+    last = state.get(username, {})
+    # Posts
+    for post in p.get_posts():
+        if last.get("post") and post.date_utc <= datetime.fromisoformat(last["post"]): break
+        L.download_post(post, target=username)
+        for r, _, f in os.walk(DOWNLOADS/username):
+            for x in f: await send_file(os.path.join(r,x), chat_id, ctx)
+        last["post"] = post.date_utc.isoformat()
+    # Stories
+    if L.context.is_logged_in:
+        found=False
         try:
-            sc=txt.rstrip("/").split("/")[-1]
-            post=instaloader.Post.from_shortcode(L.context,sc)
-            L.download_post(post,post.owner_username)
-            await update.message.reply_text("✅ Downloaded")
-        except Exception as e:
-            await update.message.reply_text(f"❌ {e}")
+            for story in instaloader.get_stories([p.userid], L.context):
+                for item in story.get_items():
+                    if last.get("story") and item.date_utc <= datetime.fromisoformat(last["story"]): continue
+                    L.download_storyitem(item, target=username)
+                    found=True
+                    for r,_,f in os.walk(DOWNLOADS/username):
+                        for x in f: await send_file(os.path.join(r,x), chat_id, ctx)
+                    last["story"]=item.date_utc.isoformat()
+        except: pass
+        if not found:
+            await ctx.bot.send_message(chat_id,"⚠️ No active stories found")
     else:
-        if not session_ok(): return
-        try:
-            prof=instaloader.Profile.from_username(L.context,txt)
-            for s in L.get_stories([prof.userid]):
-                for item in s.get_items():
-                    L.download_storyitem(item,DOWNLOAD_DIR)
-            await update.message.reply_text("✅ Stories downloaded")
-        except Exception as e:
-            await update.message.reply_text(f"❌ {e}")
+        await ctx.bot.send_message(chat_id, LANG[users[str(chat_id)]["language"]]["login_required"])
+    state[username]=last
+    save()
 
-# ---------- AUTO CHECK ----------
-async def auto_check():
-    if not session_ok(): return
-    for uid in users:
-        for username in users[uid].get("followed", []):
-            try:
-                prof=instaloader.Profile.from_username(L.context,username)
-                for s in L.get_stories([prof.userid]):
-                    for item in s.get_items():
-                        L.download_storyitem(item,DOWNLOAD_DIR)
-            except: pass
+async def fetch_link(url, chat_id, ctx):
+    d = DOWNLOADS / "link"; d.mkdir(exist_ok=True)
+    try:
+        if "/p/" in url or "/reel/" in url:
+            c = url.rstrip("/").split("/")[-1]
+            L.download_post(instaloader.Post.from_shortcode(L.context, c), target="link")
+        elif "/stories/" in url:
+            if not L.context.is_logged_in:
+                await ctx.bot.send_message(chat_id, "Login required")
+                return
+            u = url.split("/stories/")[1].split("/")[0]
+            p = instaloader.Profile.from_username(L.context,u)
+            for s in instaloader.get_stories([p.userid], L.context):
+                for i in s.get_items(): L.download_storyitem(i,target="link")
+        else:
+            await ctx.bot.send_message(chat_id, "Unsupported link")
+            return
 
-scheduler.add_job(auto_check,'interval',hours=AUTO_INTERVAL)
+        sent=False
+        for r,_,f in os.walk(d):
+            for x in f: await send_file(os.path.join(r,x), chat_id, ctx); sent=True
+        if not sent: await ctx.bot.send_message(chat_id,"Nothing downloaded")
+    except Exception as e:
+        await ctx.bot.send_message(chat_id,f"Error: {e}")
 
-# ---------- MAIN ----------
-async def main():
-    app=ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",start))
-    app.add_handler(CallbackQueryHandler(buttons))
-    app.add_handler(MessageHandler(filters.Document.ALL,handle_doc))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_text))
-    await app.run_polling()
+# ---------- Main ----------
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(cb))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text))
+    app.add_handler(MessageHandler(filters.Document.ALL, receive_session))
+    app.run_polling()
 
 if __name__=="__main__":
-    asyncio.run(main())
+    main()
+PYCODE
+
+    # ---------- config.json ----------
+    cat <<EOF > config.json
+{
+  "bot_token": "$BOT_TOKEN",
+  "admin_id": $ADMIN_ID
+}
 EOF
 
-# --- ایجاد systemd service ---
-echo "[6/10] Creating systemd service..."
-sudo tee /etc/systemd/system/insta_bot.service >/dev/null <<EOF
+    python3 -m venv venv
+    source venv/bin/activate
+    pip install --upgrade pip
+    pip install python-telegram-bot==22.3 instaloader
+
+    # ---------- systemd service ----------
+    sudo tee /etc/systemd/system/$SERVICE.service > /dev/null <<EOF
 [Unit]
 Description=Telegram Instagram Bot
 After=network.target
 
 [Service]
-WorkingDirectory=$APP_DIR
-ExecStart=$APP_DIR/venv/bin/python telegram_instabot.py
+WorkingDirectory=$PROJECT
+ExecStart=$PROJECT/venv/bin/python telegram_instabot.py
 Restart=always
-User=root
-Environment=PYTHONUNBUFFERED=1
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-echo "[7/10] Enabling and starting service..."
-sudo systemctl daemon-reload
-sudo systemctl enable insta_bot
-sudo systemctl restart insta_bot
+    sudo systemctl daemon-reload
+    sudo systemctl enable $SERVICE
+    sudo systemctl start $SERVICE
 
-echo "[8/10] Installation completed!"
-echo "[9/10] Bot is running. Check status: sudo systemctl status insta_bot"
-echo "[10/10] You can now use the bot in Telegram. Admin can upload session and manage followed accounts."
+    echo "✅ Bot installed and running"
+fi
+
+if [ "$C" == "2" ]; then
+    sudo systemctl stop $SERVICE || true
+    sudo systemctl disable $SERVICE || true
+    sudo rm -f /etc/systemd/system/$SERVICE.service
+    sudo systemctl daemon-reload
+    rm -rf "$PROJECT"
+    echo "✅ Bot removed"
+fi
+
+if [ "$C" == "3" ]; then sudo systemctl start $SERVICE; fi
+if [ "$C" == "4" ]; then sudo systemctl restart $SERVICE; fi
+if [ "$C" == "5" ]; then sudo systemctl status $SERVICE; fi
