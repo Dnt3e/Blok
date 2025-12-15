@@ -1,42 +1,42 @@
 #!/usr/bin/env python3
-import os
-import json
+import os, json
 from pathlib import Path
 from datetime import datetime
 
+import instaloader
 from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
+    ApplicationBuilder, CommandHandler,
+    CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters
 )
 
-import instaloader
-
-# ---------------- CONFIG ----------------
+# ---------- PATHS ----------
 BASE = Path(__file__).parent
-DATA = BASE / "data"
-DOWNLOADS = DATA / "downloads"
-USERS_FILE = DATA / "users.json"
-STATE_FILE = DATA / "state.json"
-SESSION_FILE = DATA / "session"
+DOWNLOADS = BASE / "downloads"
+CONFIG_FILE = BASE / "config.json"
+USERS_FILE = BASE / "users.json"
+STATE_FILE = BASE / "state.json"
+SESSION_FILE = BASE / "session"
 
-DOWNLOADS.mkdir(parents=True, exist_ok=True)
+DOWNLOADS.mkdir(exist_ok=True)
 
-USERS = json.load(open(USERS_FILE)) if USERS_FILE.exists() else {}
-STATE = json.load(open(STATE_FILE)) if STATE_FILE.exists() else {}
+for f in [USERS_FILE, STATE_FILE]:
+    if not f.exists():
+        f.write_text("{}")
 
-# --------------- INSTALOADER --------------
+CONFIG = json.loads(CONFIG_FILE.read_text())
+USERS = json.loads(USERS_FILE.read_text())
+STATE = json.loads(STATE_FILE.read_text())
+
+TOKEN = CONFIG["bot_token"]
+ADMIN = CONFIG["admin_username"]
+
+# ---------- INSTALOADER ----------
 L = instaloader.Instaloader(
     dirname_pattern=str(DOWNLOADS / "{target}"),
-    filename_pattern="{date_utc:%Y-%m-%d_%H-%M-%S}_{shortcode}",
     save_metadata=False,
     download_comments=False
 )
@@ -47,35 +47,30 @@ if SESSION_FILE.exists():
     except:
         pass
 
-
 def save():
-    json.dump(USERS, open(USERS_FILE, "w"), indent=2)
-    json.dump(STATE, open(STATE_FILE, "w"), indent=2)
+    USERS_FILE.write_text(json.dumps(USERS, indent=2))
+    STATE_FILE.write_text(json.dumps(STATE, indent=2))
 
+async def send_and_delete(file, chat_id, context):
+    with open(file, "rb") as f:
+        await context.bot.send_document(chat_id, f)
+    os.remove(file)
 
-async def send_and_delete(path, chat_id, context):
-    with open(path, "rb") as f:
-        await context.bot.send_document(chat_id=chat_id, document=f)
-    os.remove(path)
+# ---------- UI ----------
+def keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ افزودن اکانت", callback_data="add")],
+        [InlineKeyboardButton("📋 لیست اکانت‌ها", callback_data="list")],
+        [InlineKeyboardButton("⬇️ دانلود دستی", callback_data="fetch")]
+    ])
 
-
-# ---------------- BOT UI ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.username != ADMIN:
+        return
     uid = str(update.effective_user.id)
     USERS.setdefault(uid, [])
     save()
-
-    keyboard = [
-        [InlineKeyboardButton("➕ افزودن اکانت", callback_data="add")],
-        [InlineKeyboardButton("📋 لیست اکانت‌ها", callback_data="list")],
-        [InlineKeyboardButton("⬇️ دریافت پست و استوری جدید", callback_data="fetch")]
-    ]
-
-    await update.message.reply_text(
-        "👋 خوش آمدی!\nاز دکمه‌ها استفاده کن:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
+    await update.message.reply_text("👋 مدیریت بات", reply_markup=keyboard())
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -83,69 +78,57 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(q.from_user.id)
 
     if q.data == "add":
-        context.user_data["awaiting"] = True
-        await q.edit_message_text("نام کاربری اینستاگرام را بفرست:")
+        context.user_data["await"] = True
+        await q.edit_message_text("یوزرنیم اینستاگرام را بفرست:")
 
     elif q.data == "list":
         accs = USERS.get(uid, [])
         await q.edit_message_text(
-            "📋 اکانت‌ها:\n" + ("\n".join(accs) if accs else "خالی")
+            "📋 اکانت‌ها:\n" + ("\n".join(accs) if accs else "خالی"),
+            reply_markup=keyboard()
         )
 
     elif q.data == "fetch":
         await q.edit_message_text("⏳ در حال بررسی...")
         for acc in USERS.get(uid, []):
-            await fetch_instagram(acc, uid, context)
-        await q.edit_message_text("✅ تمام شد!")
-
+            await fetch(acc, uid, context)
+        await q.edit_message_text("✅ انجام شد", reply_markup=keyboard())
 
 async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting"):
+    if not context.user_data.get("await"):
         return
-
     uid = str(update.effective_user.id)
-    username = update.message.text.strip().replace("@", "")
-    USERS.setdefault(uid, []).append(username)
+    acc = update.message.text.replace("@", "").strip()
+    USERS.setdefault(uid, []).append(acc)
     save()
+    context.user_data["await"] = False
+    await update.message.reply_text(f"✔️ {acc} اضافه شد", reply_markup=keyboard())
 
-    context.user_data["awaiting"] = False
-    await update.message.reply_text(f"✔️ {username} اضافه شد")
-
-
-# ---------------- INSTAGRAM ----------------
-async def fetch_instagram(username, chat_id, context):
+# ---------- FETCH ----------
+async def fetch(username, chat_id, context):
     last = STATE.get(username, {"post": None, "story": None})
-
     try:
         profile = instaloader.Profile.from_username(L.context, username)
     except:
-        await context.bot.send_message(chat_id, f"❌ خطا در {username}")
         return
 
-    # POSTS
     for post in profile.get_posts():
         if last["post"] and post.date_utc <= datetime.fromisoformat(last["post"]):
             break
-
-        L.download_post(post, target=str(DOWNLOADS / username))
-        for f in (DOWNLOADS / username).glob(f"*{post.shortcode}*"):
+        L.download_post(post, target=username)
+        for f in (DOWNLOADS / username).iterdir():
             await send_and_delete(f, chat_id, context)
-
         last["post"] = post.date_utc.isoformat()
 
-    # STORIES
     if L.context.is_logged_in:
         try:
             for story in instaloader.get_stories([profile.userid], L.context):
                 for item in story.get_items():
                     if last["story"] and item.date_utc <= datetime.fromisoformat(last["story"]):
                         continue
-
-                    story_dir = DOWNLOADS / username / "stories"
-                    L.download_storyitem(item, target=str(story_dir))
-                    for f in story_dir.iterdir():
+                    L.download_storyitem(item, target=username)
+                    for f in (DOWNLOADS / username).iterdir():
                         await send_and_delete(f, chat_id, context)
-
                     last["story"] = item.date_utc.isoformat()
         except:
             pass
@@ -153,18 +136,13 @@ async def fetch_instagram(username, chat_id, context):
     STATE[username] = last
     save()
 
-
-# ---------------- MAIN ----------------
+# ---------- MAIN ----------
 async def main():
-    TOKEN = "PUT-YOUR-TELEGRAM-BOT-TOKEN-HERE"
-
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(menu))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_account))
-
     await app.run_polling()
-
 
 if __name__ == "__main__":
     import asyncio
