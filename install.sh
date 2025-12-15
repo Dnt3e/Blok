@@ -52,10 +52,16 @@ users = json.loads(USERS.read_text())
 state = json.loads(STATE.read_text())
 
 # ---------- Instagram ----------
-L = instaloader.Instaloader(save_metadata=False, download_comments=False, dirname_pattern=str(DOWNLOADS / "{target}"))
+L = instaloader.Instaloader(
+    save_metadata=False,
+    download_comments=False,
+    dirname_pattern=str(DOWNLOADS / "{target}")
+)
 if SESSION.exists():
-    try: L.load_session_from_file(filename=str(SESSION))
-    except: pass
+    try:
+        L.load_session_from_file(filename=str(SESSION))
+    except:
+        pass
 
 # ---------- Utils ----------
 def save():
@@ -64,161 +70,217 @@ def save():
 
 def ensure(uid):
     if uid not in users:
-        users[uid] = {"role":"admin" if uid==ADMIN_ID else "user","blocked":False,"accounts":[],"language":"en"}
+        users[uid] = {
+            "role": "admin" if uid == ADMIN_ID else "user",
+            "blocked": False,
+            "accounts": [],
+            "language": "en"
+        }
         save()
 
-def admin(uid): return users.get(uid, {}).get("role")=="admin"
-def blocked(uid): return users.get(uid, {}).get("blocked", False)
+def admin(uid): 
+    return users.get(uid, {}).get("role") == "admin"
 
 async def send_file(p, chat, ctx, caption=""):
-    with open(p,"rb") as f:
-        await ctx.bot.send_document(chat,f,caption=caption)
+    with open(p, "rb") as f:
+        await ctx.bot.send_document(chat, f, caption=caption)
     os.remove(p)
 
-# ---------- Story Scraper ----------
-STORY_SITES = [
-    lambda u: f"https://insta-stories-viewer.com/{u}/",
-    lambda u: f"https://storiesig.info/en/{u}",
-    lambda u: f"https://instadp.com/stories/{u}"
-]
-
+# ---------- Story Scraper (ONLY insta-stories-viewer.com) ----------
 async def fetch_story_sites(username, chat_id, ctx):
-    headers={"User-Agent":"Mozilla/5.0"}
-    sent_files=set()
-    for site in STORY_SITES:
-        try:
-            r=requests.get(site(username), headers=headers, timeout=15)
-            soup=BeautifulSoup(r.text,"html.parser")
-            urls=set()
+    url = f"https://insta-stories-viewer.com/{username}/"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
 
-            for v in soup.find_all("video"):
-                if v.get("src"): urls.add(v["src"])
-            for i in soup.find_all("img"):
-                if i.get("src") and "cdn" in i["src"]: urls.add(i["src"])
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        if r.status_code != 200:
+            raise Exception("Site not reachable")
 
-            for u in urls:
-                # جلوگیری از تکراری
-                h=hashlib.md5(u.encode()).hexdigest()
-                if h in sent_files: continue
-                ext=".mp4" if ".mp4" in u else ".jpg"
-                p=DOWNLOADS/f"{username}_{h}{ext}"
-                with open(p,"wb") as f: f.write(requests.get(u,headers=headers).content)
-                await send_file(p,chat_id,ctx,caption=f"Story from @{username}")
-                sent_files.add(h)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-            if sent_files: return
-        except: pass
+        stories_section = soup.find("section", {"id": "stories"})
+        if not stories_section:
+            await ctx.bot.send_message(chat_id, "⚠️ No public stories found")
+            return
 
-    if not sent_files:
-        await ctx.bot.send_message(chat_id,"⚠️ No public stories found")
+        sent = False
+        used = set()
+
+        # videos
+        for video in stories_section.find_all("video"):
+            src = None
+            if video.find("source"):
+                src = video.find("source").get("src")
+            if not src:
+                continue
+
+            h = hashlib.md5(src.encode()).hexdigest()
+            if h in used:
+                continue
+
+            p = DOWNLOADS / f"{username}_{h}.mp4"
+            with open(p, "wb") as f:
+                f.write(requests.get(src, headers=headers).content)
+
+            await send_file(p, chat_id, ctx, caption=f"📹 Story @{username}")
+            used.add(h)
+            sent = True
+
+        # images
+        for img in stories_section.find_all("img"):
+            src = img.get("data-src") or img.get("src")
+            if not src:
+                continue
+
+            h = hashlib.md5(src.encode()).hexdigest()
+            if h in used:
+                continue
+
+            p = DOWNLOADS / f"{username}_{h}.jpg"
+            with open(p, "wb") as f:
+                f.write(requests.get(src, headers=headers).content)
+
+            await send_file(p, chat_id, ctx, caption=f"🖼 Story @{username}")
+            used.add(h)
+            sent = True
+
+        if not sent:
+            await ctx.bot.send_message(chat_id, "⚠️ No public stories found")
+
+    except Exception as e:
+        await ctx.bot.send_message(chat_id, "⚠️ Failed to fetch stories")
 
 # ---------- Menu ----------
 def menu(uid):
-    b=[
-        [InlineKeyboardButton("➕ Add Account",callback_data="add")],
-        [InlineKeyboardButton("⬇️ Fetch",callback_data="fetch")],
-        [InlineKeyboardButton("🔗 Link",callback_data="link")]
+    b = [
+        [InlineKeyboardButton("➕ Add Account", callback_data="add")],
+        [InlineKeyboardButton("⬇️ Fetch", callback_data="fetch")],
+        [InlineKeyboardButton("🔗 Link", callback_data="link")]
     ]
     if admin(uid):
-        b.append([InlineKeyboardButton("🔐 Upload Session",callback_data="session")])
-        b.append([InlineKeyboardButton("👥 Users",callback_data="users")])
+        b.append([InlineKeyboardButton("🔐 Upload Session", callback_data="session")])
+        b.append([InlineKeyboardButton("👥 Users", callback_data="users")])
     return InlineKeyboardMarkup(b)
 
 # ---------- Handlers ----------
-async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    uid=str(update.effective_user.id); ensure(uid)
-    await update.message.reply_text("🤖 Bot Ready",reply_markup=menu(uid))
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    ensure(uid)
+    await update.message.reply_text("🤖 Bot Ready", reply_markup=menu(uid))
 
-async def cb(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; await q.answer()
-    uid=str(q.from_user.id); ensure(uid)
+async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = str(q.from_user.id)
+    ensure(uid)
 
-    if q.data=="add":
-        ctx.user_data["await"]="add"; await q.edit_message_text("Send Instagram username:")
-    elif q.data=="fetch":
+    if q.data == "add":
+        ctx.user_data["await"] = "add"
+        await q.edit_message_text("Send Instagram username:")
+    elif q.data == "fetch":
         await q.edit_message_text("Checking...")
         for a in users[uid]["accounts"]:
-            await fetch_account(a,q.message.chat_id,ctx)
-        await q.edit_message_text("Done",reply_markup=menu(uid))
-    elif q.data=="link":
-        ctx.user_data["await"]="link"; await q.edit_message_text("Send Instagram link:")
-    elif q.data=="session" and admin(uid):
-        ctx.user_data["await"]="session"; await q.edit_message_text("Send session file:")
-    elif q.data=="users" and admin(uid):
-        txt="\n".join(f"{u} | {d['role']} | blocked={d['blocked']}" for u,d in users.items())
+            await fetch_account(a, q.message.chat_id, ctx)
+        await q.edit_message_text("Done", reply_markup=menu(uid))
+    elif q.data == "link":
+        ctx.user_data["await"] = "link"
+        await q.edit_message_text("Send Instagram link:")
+    elif q.data == "session" and admin(uid):
+        ctx.user_data["await"] = "session"
+        await q.edit_message_text("Send session file:")
+    elif q.data == "users" and admin(uid):
+        txt = "\n".join(f"{u} | {d['role']} | blocked={d['blocked']}" for u, d in users.items())
         await q.edit_message_text(txt)
 
-async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    uid=str(update.effective_user.id); ensure(uid)
-    if ctx.user_data.get("await")=="add":
-        users[uid]["accounts"].append(update.message.text.strip().replace("@",""))
-        save(); ctx.user_data.clear()
-        await update.message.reply_text("Added",reply_markup=menu(uid))
-    elif ctx.user_data.get("await")=="link":
-        ctx.user_data.clear()
-        await fetch_link(update.message.text.strip(),update.message.chat_id,ctx)
+async def text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    ensure(uid)
 
-async def receive_session(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    uid=str(update.effective_user.id)
-    if not admin(uid): return
-    if ctx.user_data.get("await")!="session": return
-    doc=update.message.document
-    if not doc: return
-    file=await doc.get_file()
+    if ctx.user_data.get("await") == "add":
+        users[uid]["accounts"].append(update.message.text.strip().replace("@", ""))
+        save()
+        ctx.user_data.clear()
+        await update.message.reply_text("Added", reply_markup=menu(uid))
+
+    elif ctx.user_data.get("await") == "link":
+        ctx.user_data.clear()
+        await fetch_link(update.message.text.strip(), update.message.chat_id, ctx)
+
+async def receive_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    if not admin(uid):
+        return
+    if ctx.user_data.get("await") != "session":
+        return
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    file = await doc.get_file()
     await file.download_to_drive(SESSION)
     L.load_session_from_file(filename=str(SESSION))
     ctx.user_data.clear()
     await update.message.reply_text("✅ Session loaded")
 
 # ---------- Fetch ----------
-async def fetch_account(username,chat_id,ctx):
-    # Posts/Reels
-    try: p=instaloader.Profile.from_username(L.context,username)
-    except: return
-    last=state.get(username,{})
+async def fetch_account(username, chat_id, ctx):
+    try:
+        p = instaloader.Profile.from_username(L.context, username)
+    except:
+        return
+
+    last = state.get(username, {})
 
     for post in p.get_posts():
-        if last.get("post") and post.date_utc<=datetime.fromisoformat(last["post"]): continue
-        L.download_post(post,target=username)
-        for r,_,f in os.walk(DOWNLOADS/username):
-            for x in f: await send_file(os.path.join(r,x),chat_id,ctx,caption=f"@{username}")
-        last["post"]=post.date_utc.isoformat()
+        if last.get("post") and post.date_utc <= datetime.fromisoformat(last["post"]):
+            break
+        L.download_post(post, target=username)
+        for r, _, f in os.walk(DOWNLOADS / username):
+            for x in f:
+                await send_file(os.path.join(r, x), chat_id, ctx, caption=f"@{username}")
+        last["post"] = post.date_utc.isoformat()
         break
 
-    state[username]=last
+    state[username] = last
     save()
-    # Stories
-    await fetch_story_sites(username,chat_id,ctx)
 
-async def fetch_link(url,chat_id,ctx):
+    await fetch_story_sites(username, chat_id, ctx)
+
+async def fetch_link(url, chat_id, ctx):
     try:
         if "/p/" in url or "/reel/" in url:
-            c=url.rstrip("/").split("/")[-1]
-            L.download_post(instaloader.Post.from_shortcode(L.context,c),"link")
-            for r,_,f in os.walk(DOWNLOADS/"link"):
-                for x in f: await send_file(os.path.join(r,x),chat_id,ctx)
+            c = url.rstrip("/").split("/")[-1]
+            L.download_post(instaloader.Post.from_shortcode(L.context, c), "link")
+            for r, _, f in os.walk(DOWNLOADS / "link"):
+                for x in f:
+                    await send_file(os.path.join(r, x), chat_id, ctx)
         elif "/stories/" in url:
-            u=url.split("/stories/")[1].split("/")[0]
-            await fetch_story_sites(u,chat_id,ctx)
+            u = url.split("/stories/")[1].split("/")[0]
+            await fetch_story_sites(u, chat_id, ctx)
     except Exception as e:
-        await ctx.bot.send_message(chat_id,str(e))
+        await ctx.bot.send_message(chat_id, str(e))
 
 # ---------- Main ----------
 def main():
-    app=ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",start))
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(cb))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text))
-    app.add_handler(MessageHandler(filters.Document.ALL,receive_session))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text))
+    app.add_handler(MessageHandler(filters.Document.ALL, receive_session))
     app.run_polling()
 
-if __name__=="__main__": main()
+if __name__ == "__main__":
+    main()
 PYCODE
 
 cat <<EOF > config.json
 {
-  "bot_token":"$BOT_TOKEN",
-  "admin_id":$ADMIN_ID
+  "bot_token": "$BOT_TOKEN",
+  "admin_id": $ADMIN_ID
 }
 EOF
 
@@ -231,11 +293,13 @@ sudo tee /etc/systemd/system/$SERVICE.service >/dev/null <<EOF
 [Unit]
 Description=Instagram Bot
 After=network.target
+
 [Service]
 WorkingDirectory=$PROJECT
 ExecStart=$PROJECT/venv/bin/python telegram_instabot.py
 Restart=always
 RestartSec=5
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -243,6 +307,7 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable $SERVICE
 sudo systemctl start $SERVICE
+
 echo "✅ Bot Installed and Running"
 fi
 
