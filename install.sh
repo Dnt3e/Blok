@@ -1,6 +1,5 @@
 #!/bin/bash
 set -e
-
 echo "🚀 Telegram Instagram Bot Installer"
 
 sudo apt update
@@ -8,17 +7,16 @@ sudo apt install -y python3 python3-venv python3-pip
 
 cd "$(dirname "$0")"
 
-# ---------- MENU ----------
-echo "------- MENU / منو -------"
-echo "1) Install / نصب"
-echo "2) Remove / حذف کامل"
-echo "3) Start / استارت"
-echo "4) Restart / ری‌استارت"
-echo "5) Status / وضعیت"
+# MENU
+echo "------- MENU -------"
+echo "1) Install"
+echo "2) Remove"
+echo "3) Start"
+echo "4) Restart"
+echo "5) Status"
 read -p "Choose an option (1-5): " CHOICE
 
 if [ "$CHOICE" == "1" ]; then
-    # ---------- INSTALL ----------
     read -p "🤖 Telegram Bot Token: " BOT_TOKEN
     read -p "🆔 Telegram Admin ID: " ADMIN_ID
     read -p "⏱ Auto check interval in hours [default 3]: " INTERVAL
@@ -33,13 +31,13 @@ if [ "$CHOICE" == "1" ]; then
 }
 EOF
 
-    # Create virtual environment
+    # Create venv and install packages
     python3 -m venv venv
     source venv/bin/activate
     pip install --upgrade pip
     pip install python-telegram-bot==22.3 instaloader
 
-    # ---------- SYSTEMD ----------
+    # SYSTEMD
     sudo tee /etc/systemd/system/insta_bot.service > /dev/null <<EOF
 [Unit]
 Description=Telegram Instagram Bot
@@ -73,7 +71,6 @@ EOF
     echo "✅ Bot installed and running"
 
 elif [ "$CHOICE" == "2" ]; then
-    # ---------- REMOVE ----------
     sudo systemctl stop insta_bot insta_bot.timer || true
     sudo systemctl disable insta_bot insta_bot.timer || true
     sudo rm -f /etc/systemd/system/insta_bot.service /etc/systemd/system/insta_bot.timer
@@ -95,5 +92,5 @@ elif [ "$CHOICE" == "5" ]; then
     sudo systemctl status insta_bot
 
 else
-    echo "❌ Invalid choice / گزینه نامعتبر"
+    echo "❌ Invalid choice"
 fi
