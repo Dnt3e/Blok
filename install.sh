@@ -8,24 +8,27 @@ echo "===================================="
 # --- دریافت اطلاعات اولیه ---
 read -p "Enter Telegram Bot Token: " BOT_TOKEN
 read -p "Enter Admin Telegram User ID: " ADMIN_ID
-read -p "Enter Auto-Check Interval (hours): " AUTO_INTERVAL
+read -p "Enter Auto-Check Interval (hours, e.g., 1): " AUTO_INTERVAL
 
 APP_DIR="$HOME/Blok"
 PYTHON_BIN="/usr/bin/python3"
 
-echo "[1/8] Creating project directory..."
+echo "[1/10] Creating project directory..."
 mkdir -p "$APP_DIR"
 cd "$APP_DIR"
 
-echo "[2/8] Creating virtual environment..."
+echo "[2/10] Creating virtual environment..."
 $PYTHON_BIN -m venv venv
 source venv/bin/activate
 
-echo "[3/8] Installing Python packages..."
+echo "[3/10] Installing Python packages..."
 pip install --upgrade pip
 pip install python-telegram-bot==22.3 instaloader nest_asyncio apscheduler
 
-echo "[4/8] Writing bot source code..."
+echo "[4/10] Creating downloads folder..."
+mkdir -p downloads
+
+echo "[5/10] Writing bot source code..."
 cat > telegram_instabot.py <<EOF
 import asyncio, os, logging, nest_asyncio, instaloader
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -36,7 +39,7 @@ nest_asyncio.apply()
 
 BOT_TOKEN = "${BOT_TOKEN}"
 ADMIN_ID = int("${ADMIN_ID}")
-AUTO_INTERVAL = ${AUTO_INTERVAL}  # ساعت
+AUTO_INTERVAL = ${AUTO_INTERVAL}
 
 SESSION_FILE = "ig.session"
 DOWNLOAD_DIR = "downloads"
@@ -55,8 +58,7 @@ def load_users():
         return {}
     return eval(open(USERS_FILE).read())
 
-def save_users(u):
-    open(USERS_FILE,"w").write(str(u))
+def save_users(u): open(USERS_FILE,"w").write(str(u))
 
 users = load_users()
 
@@ -64,7 +66,7 @@ def is_admin(uid): return uid == ADMIN_ID
 
 def ensure_user(uid):
     if uid not in users:
-        users[uid] = {"lang":"EN","limit":20,"followed":[]}
+        users[uid] = {"lang":"EN","limit":20,"followed":[],"interval":AUTO_INTERVAL}
         save_users(users)
 
 # ---------- SESSION ----------
@@ -116,6 +118,9 @@ async def buttons(update:Update,ctx):
         if is_admin(uid):
             kb.append([InlineKeyboardButton("🔐 Upload Session",callback_data="upload")])
             kb.append([InlineKeyboardButton("🩺 Session Health",callback_data="health")])
+            kb.append([InlineKeyboardButton("🗂 Manage Followed Accounts",callback_data="followed")])
+            kb.append([InlineKeyboardButton("⏱ Set Auto-Check Interval",callback_data="interval")])
+        kb.append([InlineKeyboardButton("◀ Back", callback_data="back")])
         await q.message.reply_text("Settings",reply_markup=InlineKeyboardMarkup(kb))
     elif q.data=="lang":
         users[uid]["lang"]="FA" if users[uid]["lang"]=="EN" else "EN"
@@ -125,6 +130,14 @@ async def buttons(update:Update,ctx):
         await q.message.reply_text("✅ Session OK" if session_ok() else "❌ Invalid session")
     elif q.data=="upload":
         await q.message.reply_text("Send session file")
+    elif q.data=="followed":
+        await q.message.reply_text(
+            "Commands:\n/add username\n/remove username\n/list",
+        )
+    elif q.data=="interval":
+        await q.message.reply_text("Send new interval in hours")
+    elif q.data=="back":
+        await q.message.reply_text("Main Menu",reply_markup=main_menu(users[uid]["lang"]))
 
 # ---------- HANDLERS ----------
 async def handle_doc(update:Update,ctx):
@@ -139,6 +152,34 @@ async def handle_text(update:Update,ctx):
     ensure_user(uid)
     txt=update.message.text.strip()
 
+    # Followed accounts management
+    if is_admin(uid):
+        if txt.startswith("/add "):
+            usern=txt.split(" ",1)[1]
+            if usern not in users[uid]["followed"]:
+                users[uid]["followed"].append(usern)
+                save_users(users)
+                await update.message.reply_text(f"✅ Added {usern}")
+            return
+        if txt.startswith("/remove "):
+            usern=txt.split(" ",1)[1]
+            if usern in users[uid]["followed"]:
+                users[uid]["followed"].remove(usern)
+                save_users(users)
+                await update.message.reply_text(f"✅ Removed {usern}")
+            return
+        if txt=="/list":
+            await update.message.reply_text("Followed: "+", ".join(users[uid]["followed"]))
+            return
+        if txt.isdigit():
+            users[uid]["interval"]=int(txt)
+            scheduler.remove_all_jobs()
+            scheduler.add_job(auto_check,'interval',hours=int(txt))
+            save_users(users)
+            await update.message.reply_text(f"✅ Interval set to {txt} hours")
+            return
+
+    # Instagram link
     if "instagram.com" in txt:
         try:
             sc=txt.rstrip("/").split("/")[-1]
@@ -186,7 +227,7 @@ if __name__=="__main__":
 EOF
 
 # --- ایجاد systemd service ---
-echo "[5/8] Creating systemd service..."
+echo "[6/10] Creating systemd service..."
 sudo tee /etc/systemd/system/insta_bot.service >/dev/null <<EOF
 [Unit]
 Description=Telegram Instagram Bot
@@ -203,10 +244,11 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=multi-user.target
 EOF
 
-echo "[6/8] Enabling and starting service..."
+echo "[7/10] Enabling and starting service..."
 sudo systemctl daemon-reload
 sudo systemctl enable insta_bot
 sudo systemctl restart insta_bot
 
-echo "[7/8] Installation completed!"
-echo "[8/8] Bot is running. Check status: sudo systemctl status insta_bot"
+echo "[8/10] Installation completed!"
+echo "[9/10] Bot is running. Check status: sudo systemctl status insta_bot"
+echo "[10/10] You can now use the bot in Telegram. Admin can upload session and manage followed accounts."
