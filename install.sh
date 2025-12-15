@@ -16,20 +16,25 @@ if [ "$C" == "1" ]; then
     read -p "Telegram Admin ID: " ADMIN_ID
 
     sudo apt update
-    sudo apt install -y python3 python3-venv python3-pip
+    sudo apt install -y python3 python3-venv python3-pip curl
 
     mkdir -p "$PROJECT"
     cd "$PROJECT"
 
+# ================= BOT CODE =================
 cat <<'PYCODE' > telegram_instabot.py
 #!/usr/bin/env python3
-import os, json, requests, hashlib
+import os, json, asyncio, subprocess
 from pathlib import Path
 from datetime import datetime
 import instaloader
-from bs4 import BeautifulSoup
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler,
+    CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters
+)
 
 # ---------- Paths ----------
 BASE = Path(__file__).parent
@@ -51,12 +56,13 @@ ADMIN_ID = str(cfg["admin_id"])
 users = json.loads(USERS.read_text())
 state = json.loads(STATE.read_text())
 
-# ---------- Instagram ----------
+# ---------- Instagram (posts only) ----------
 L = instaloader.Instaloader(
     save_metadata=False,
     download_comments=False,
     dirname_pattern=str(DOWNLOADS / "{target}")
 )
+
 if SESSION.exists():
     try:
         L.load_session_from_file(filename=str(SESSION))
@@ -73,97 +79,78 @@ def ensure(uid):
         users[uid] = {
             "role": "admin" if uid == ADMIN_ID else "user",
             "blocked": False,
-            "accounts": [],
-            "language": "en"
+            "accounts": []
         }
         save()
 
-def admin(uid): 
-    return users.get(uid, {}).get("role") == "admin"
+def admin(uid): return users.get(uid, {}).get("role") == "admin"
 
-async def send_file(p, chat, ctx, caption=""):
-    with open(p, "rb") as f:
+async def send_file(path, chat, ctx, caption=""):
+    with open(path, "rb") as f:
         await ctx.bot.send_document(chat, f, caption=caption)
-    os.remove(p)
+    os.remove(path)
 
-# ---------- Story Scraper (ONLY insta-stories-viewer.com) ----------
-async def fetch_story_sites(username, chat_id, ctx):
-    url = f"https://insta-stories-viewer.com/{username}/"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
+# ---------- Story Downloader (Playwright) ----------
+async def fetch_story(username, chat_id, ctx):
+    out_dir = DOWNLOADS / f"story_{username}"
+    out_dir.mkdir(exist_ok=True)
 
-    try:
-        r = requests.get(url, headers=headers, timeout=20)
-        if r.status_code != 200:
-            raise Exception("Site not reachable")
+    script = f"""
+from playwright.sync_api import sync_playwright
+import requests, os, time
 
-        soup = BeautifulSoup(r.text, "html.parser")
+url = "https://insta-stories-viewer.com/{username}/"
+out = "{out_dir}"
 
-        stories_section = soup.find("section", {"id": "stories"})
-        if not stories_section:
-            await ctx.bot.send_message(chat_id, "⚠️ No public stories found")
-            return
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page()
+    page.goto(url, timeout=60000)
+    page.wait_for_timeout(6000)
 
-        sent = False
-        used = set()
+    media = page.query_selector_all("video source, img")
+    urls = set()
 
-        # videos
-        for video in stories_section.find_all("video"):
-            src = None
-            if video.find("source"):
-                src = video.find("source").get("src")
-            if not src:
-                continue
+    for m in media:
+        src = m.get_attribute("src")
+        if src and ("mp4" in src or "jpg" in src or "jpeg" in src):
+            urls.add(src)
 
-            h = hashlib.md5(src.encode()).hexdigest()
-            if h in used:
-                continue
+    for u in urls:
+        name = u.split("?")[0].split("/")[-1]
+        r = requests.get(u, timeout=20)
+        if r.status_code == 200:
+            with open(os.path.join(out, name), "wb") as f:
+                f.write(r.content)
 
-            p = DOWNLOADS / f"{username}_{h}.mp4"
-            with open(p, "wb") as f:
-                f.write(requests.get(src, headers=headers).content)
+    browser.close()
+"""
 
-            await send_file(p, chat_id, ctx, caption=f"📹 Story @{username}")
-            used.add(h)
-            sent = True
+    proc = await asyncio.create_subprocess_shell(
+        f"python3 - <<'EOF'\n{script}\nEOF",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
 
-        # images
-        for img in stories_section.find_all("img"):
-            src = img.get("data-src") or img.get("src")
-            if not src:
-                continue
+    await proc.communicate()
 
-            h = hashlib.md5(src.encode()).hexdigest()
-            if h in used:
-                continue
+    files = list(out_dir.glob("*"))
+    if not files:
+        await ctx.bot.send_message(chat_id, "⚠️ No public stories found")
+        return
 
-            p = DOWNLOADS / f"{username}_{h}.jpg"
-            with open(p, "wb") as f:
-                f.write(requests.get(src, headers=headers).content)
-
-            await send_file(p, chat_id, ctx, caption=f"🖼 Story @{username}")
-            used.add(h)
-            sent = True
-
-        if not sent:
-            await ctx.bot.send_message(chat_id, "⚠️ No public stories found")
-
-    except Exception as e:
-        await ctx.bot.send_message(chat_id, "⚠️ Failed to fetch stories")
+    for f in files:
+        await send_file(f, chat_id, ctx, caption=f"Story @{username}")
 
 # ---------- Menu ----------
 def menu(uid):
-    b = [
+    buttons = [
         [InlineKeyboardButton("➕ Add Account", callback_data="add")],
-        [InlineKeyboardButton("⬇️ Fetch", callback_data="fetch")],
-        [InlineKeyboardButton("🔗 Link", callback_data="link")]
+        [InlineKeyboardButton("⬇️ Fetch", callback_data="fetch")]
     ]
     if admin(uid):
-        b.append([InlineKeyboardButton("🔐 Upload Session", callback_data="session")])
-        b.append([InlineKeyboardButton("👥 Users", callback_data="users")])
-    return InlineKeyboardMarkup(b)
+        buttons.append([InlineKeyboardButton("🔐 Upload Session", callback_data="session")])
+    return InlineKeyboardMarkup(buttons)
 
 # ---------- Handlers ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -185,41 +172,26 @@ async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for a in users[uid]["accounts"]:
             await fetch_account(a, q.message.chat_id, ctx)
         await q.edit_message_text("Done", reply_markup=menu(uid))
-    elif q.data == "link":
-        ctx.user_data["await"] = "link"
-        await q.edit_message_text("Send Instagram link:")
     elif q.data == "session" and admin(uid):
         ctx.user_data["await"] = "session"
         await q.edit_message_text("Send session file:")
-    elif q.data == "users" and admin(uid):
-        txt = "\n".join(f"{u} | {d['role']} | blocked={d['blocked']}" for u, d in users.items())
-        await q.edit_message_text(txt)
 
 async def text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     ensure(uid)
 
     if ctx.user_data.get("await") == "add":
-        users[uid]["accounts"].append(update.message.text.strip().replace("@", ""))
+        users[uid]["accounts"].append(update.message.text.strip().replace("@",""))
         save()
         ctx.user_data.clear()
         await update.message.reply_text("Added", reply_markup=menu(uid))
 
-    elif ctx.user_data.get("await") == "link":
-        ctx.user_data.clear()
-        await fetch_link(update.message.text.strip(), update.message.chat_id, ctx)
-
 async def receive_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    if not admin(uid):
-        return
-    if ctx.user_data.get("await") != "session":
-        return
+    if not admin(uid): return
+    if ctx.user_data.get("await") != "session": return
 
     doc = update.message.document
-    if not doc:
-        return
-
     file = await doc.get_file()
     await file.download_to_drive(SESSION)
     L.load_session_from_file(filename=str(SESSION))
@@ -228,41 +200,28 @@ async def receive_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Fetch ----------
 async def fetch_account(username, chat_id, ctx):
+    # Posts
     try:
         p = instaloader.Profile.from_username(L.context, username)
     except:
         return
 
     last = state.get(username, {})
-
     for post in p.get_posts():
         if last.get("post") and post.date_utc <= datetime.fromisoformat(last["post"]):
             break
         L.download_post(post, target=username)
         for r, _, f in os.walk(DOWNLOADS / username):
             for x in f:
-                await send_file(os.path.join(r, x), chat_id, ctx, caption=f"@{username}")
+                await send_file(os.path.join(r, x), chat_id, ctx)
         last["post"] = post.date_utc.isoformat()
         break
 
     state[username] = last
     save()
 
-    await fetch_story_sites(username, chat_id, ctx)
-
-async def fetch_link(url, chat_id, ctx):
-    try:
-        if "/p/" in url or "/reel/" in url:
-            c = url.rstrip("/").split("/")[-1]
-            L.download_post(instaloader.Post.from_shortcode(L.context, c), "link")
-            for r, _, f in os.walk(DOWNLOADS / "link"):
-                for x in f:
-                    await send_file(os.path.join(r, x), chat_id, ctx)
-        elif "/stories/" in url:
-            u = url.split("/stories/")[1].split("/")[0]
-            await fetch_story_sites(u, chat_id, ctx)
-    except Exception as e:
-        await ctx.bot.send_message(chat_id, str(e))
+    # Stories (no login)
+    await fetch_story(username, chat_id, ctx)
 
 # ---------- Main ----------
 def main():
@@ -276,7 +235,9 @@ def main():
 if __name__ == "__main__":
     main()
 PYCODE
+# ================= END BOT =================
 
+# ---------- config ----------
 cat <<EOF > config.json
 {
   "bot_token": "$BOT_TOKEN",
@@ -287,11 +248,12 @@ EOF
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install python-telegram-bot==22.3 instaloader requests beautifulsoup4
+pip install python-telegram-bot==22.3 instaloader playwright requests
+playwright install chromium
 
 sudo tee /etc/systemd/system/$SERVICE.service >/dev/null <<EOF
 [Unit]
-Description=Instagram Bot
+Description=Telegram Instagram Bot
 After=network.target
 
 [Service]
