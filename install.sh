@@ -12,6 +12,7 @@ echo "4) Restart Bot"
 echo "5) Status Bot"
 read -p "Choose option [1-5]: " C
 
+# ================= INSTALL =================
 if [ "$C" == "1" ]; then
     read -p "Telegram Bot Token: " BOT_TOKEN
     read -p "Telegram Admin ID: " ADMIN_ID
@@ -194,7 +195,7 @@ async def receive_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to load session\n{e}")
 
-# ---------- Fetch ----------
+# ---------- Fetch functions ----------
 async def fetch_account(username, chat_id, ctx):
     try: p=instaloader.Profile.from_username(L.context, username)
     except: return
@@ -299,7 +300,7 @@ sudo systemctl enable $SERVICE
 sudo systemctl start $SERVICE
 echo "✅ Bot installed and running. Logs at $LOGFILE"
 
-# ---------- Remove ----------
+# ================= REMOVE =================
 if [ "$C" == "2" ]; then
     sudo systemctl stop $SERVICE || true
     sudo systemctl disable $SERVICE || true
@@ -309,6 +310,17 @@ if [ "$C" == "2" ]; then
     echo "✅ Bot removed"
 fi
 
-if [ "$C" == "3" ]; then sudo systemctl start $SERVICE; fi
-if [ "$C" == "4" ]; then sudo systemctl restart $SERVICE; fi
-if [ "$C" == "5" ]; then sudo systemctl status $SERVICE; fi
+# ================= START =================
+if [ "$C" == "3" ]; then
+    sudo systemctl start $SERVICE
+fi
+
+# ================= RESTART =================
+if [ "$C" == "4" ]; then
+    sudo systemctl restart $SERVICE
+fi
+
+# ================= STATUS =================
+if [ "$C" == "5" ]; then
+    sudo systemctl status $SERVICE
+fi
