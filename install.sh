@@ -21,15 +21,15 @@ if [ "$C" == "1" ]; then
     mkdir -p "$PROJECT"
     cd "$PROJECT"
 
-    # ---------- telegram_instabot.py ----------
-    cat <<'PYCODE' > telegram_instabot.py
+cat <<'PYCODE' > telegram_instabot.py
 #!/usr/bin/env python3
-import os, json, asyncio, requests
+import os, json, requests, hashlib
 from pathlib import Path
 from datetime import datetime
+import instaloader
+from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
-import instaloader
 
 # ---------- Paths ----------
 BASE = Path(__file__).parent
@@ -40,13 +40,9 @@ STATE = BASE / "state.json"
 SESSION = BASE / "session"
 
 DOWNLOADS.mkdir(exist_ok=True)
-for f, d in [(USERS, {}), (STATE, {})]:
+for f in [USERS, STATE]:
     if not f.exists():
-        f.write_text(json.dumps(d))
-
-if not CONFIG.exists():
-    print("config.json not found")
-    exit(1)
+        f.write_text("{}")
 
 cfg = json.loads(CONFIG.read_text())
 BOT_TOKEN = cfg["bot_token"]
@@ -55,239 +51,199 @@ ADMIN_ID = str(cfg["admin_id"])
 users = json.loads(USERS.read_text())
 state = json.loads(STATE.read_text())
 
-# ---------- Instagram Loader ----------
+# ---------- Instagram ----------
 L = instaloader.Instaloader(save_metadata=False, download_comments=False, dirname_pattern=str(DOWNLOADS / "{target}"))
 if SESSION.exists():
     try: L.load_session_from_file(filename=str(SESSION))
     except: pass
 
-# ---------- Utility ----------
+# ---------- Utils ----------
 def save():
     USERS.write_text(json.dumps(users, indent=2))
     STATE.write_text(json.dumps(state, indent=2))
 
 def ensure(uid):
     if uid not in users:
-        users[uid] = {"role": "admin" if uid == ADMIN_ID else "user", "blocked": False, "accounts": [], "language":"en","interval":1}
+        users[uid] = {"role":"admin" if uid==ADMIN_ID else "user","blocked":False,"accounts":[],"language":"en"}
         save()
 
-def admin(uid): return users.get(uid, {}).get("role") == "admin"
+def admin(uid): return users.get(uid, {}).get("role")=="admin"
 def blocked(uid): return users.get(uid, {}).get("blocked", False)
 
-async def send_file(p, chat, ctx):
-    with open(p, "rb") as f:
-        await ctx.bot.send_document(chat, f)
+async def send_file(p, chat, ctx, caption=""):
+    with open(p,"rb") as f:
+        await ctx.bot.send_document(chat,f,caption=caption)
     os.remove(p)
 
-# ---------- Language ----------
-LANG = {
-    "fa":{"start":"🤖 ربات آماده است","add":"➕ افزودن اکانت","fetch":"⬇️ بررسی جدیدها","link":"🔗 دانلود با لینک","login_required":"❌ برای استوری باید session آپلود شود"},
-    "en":{"start":"🤖 Bot is ready","add":"➕ Add Account","fetch":"⬇️ Check New","link":"🔗 Download by Link","login_required":"❌ Instagram session required for stories"}
-}
+# ---------- Story Scraper ----------
+STORY_SITES = [
+    lambda u: f"https://insta-stories-viewer.com/{u}/",
+    lambda u: f"https://storiesig.info/en/{u}",
+    lambda u: f"https://instadp.com/stories/{u}"
+]
 
-def menu(is_admin=False, lang="en"):
-    buttons = [
-        [InlineKeyboardButton(LANG[lang]["add"], callback_data="add")],
-        [InlineKeyboardButton(LANG[lang]["fetch"], callback_data="fetch")],
-        [InlineKeyboardButton(LANG[lang]["link"], callback_data="link")]
+async def fetch_story_sites(username, chat_id, ctx):
+    headers={"User-Agent":"Mozilla/5.0"}
+    sent_files=set()
+    for site in STORY_SITES:
+        try:
+            r=requests.get(site(username), headers=headers, timeout=15)
+            soup=BeautifulSoup(r.text,"html.parser")
+            urls=set()
+
+            for v in soup.find_all("video"):
+                if v.get("src"): urls.add(v["src"])
+            for i in soup.find_all("img"):
+                if i.get("src") and "cdn" in i["src"]: urls.add(i["src"])
+
+            for u in urls:
+                # جلوگیری از تکراری
+                h=hashlib.md5(u.encode()).hexdigest()
+                if h in sent_files: continue
+                ext=".mp4" if ".mp4" in u else ".jpg"
+                p=DOWNLOADS/f"{username}_{h}{ext}"
+                with open(p,"wb") as f: f.write(requests.get(u,headers=headers).content)
+                await send_file(p,chat_id,ctx,caption=f"Story from @{username}")
+                sent_files.add(h)
+
+            if sent_files: return
+        except: pass
+
+    if not sent_files:
+        await ctx.bot.send_message(chat_id,"⚠️ No public stories found")
+
+# ---------- Menu ----------
+def menu(uid):
+    b=[
+        [InlineKeyboardButton("➕ Add Account",callback_data="add")],
+        [InlineKeyboardButton("⬇️ Fetch",callback_data="fetch")],
+        [InlineKeyboardButton("🔗 Link",callback_data="link")]
     ]
-    if is_admin:
-        buttons.append([InlineKeyboardButton("🔐 Upload IG Session", callback_data="upload_session")])
-        buttons.append([InlineKeyboardButton("👥 Users", callback_data="users")])
-    return InlineKeyboardMarkup(buttons)
+    if admin(uid):
+        b.append([InlineKeyboardButton("🔐 Upload Session",callback_data="session")])
+        b.append([InlineKeyboardButton("👥 Users",callback_data="users")])
+    return InlineKeyboardMarkup(b)
 
-# ---------- Bot Handlers ----------
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    ensure(uid)
-    if blocked(uid): return
-    lang = users[uid]["language"]
-    await update.message.reply_text(LANG[lang]["start"], reply_markup=menu(admin(uid), lang))
+# ---------- Handlers ----------
+async def start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    uid=str(update.effective_user.id); ensure(uid)
+    await update.message.reply_text("🤖 Bot Ready",reply_markup=menu(uid))
 
-async def cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = str(q.from_user.id)
-    ensure(uid)
-    if blocked(uid): return
-    lang = users[uid]["language"]
+async def cb(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    uid=str(q.from_user.id); ensure(uid)
 
-    if q.data == "add":
-        ctx.user_data["await"] = "add"
-        await q.edit_message_text("Send Instagram username")
-    elif q.data == "fetch":
+    if q.data=="add":
+        ctx.user_data["await"]="add"; await q.edit_message_text("Send Instagram username:")
+    elif q.data=="fetch":
         await q.edit_message_text("Checking...")
         for a in users[uid]["accounts"]:
-            await fetch_account(a, q.message.chat_id, ctx)
-        await q.edit_message_text("Done", reply_markup=menu(admin(uid), lang))
-    elif q.data == "link":
-        ctx.user_data["await"] = "link"
-        await q.edit_message_text("Send link")
-    elif q.data == "upload_session" and admin(uid):
-        ctx.user_data["await"] = "session"
-        await q.edit_message_text("📤 Please send Instagram session file (session-USERNAME)")
-    elif q.data == "users" and admin(uid):
-        txt = "\n".join(f"{u} | {d['role']} | blocked={d['blocked']}" for u,d in users.items())
+            await fetch_account(a,q.message.chat_id,ctx)
+        await q.edit_message_text("Done",reply_markup=menu(uid))
+    elif q.data=="link":
+        ctx.user_data["await"]="link"; await q.edit_message_text("Send Instagram link:")
+    elif q.data=="session" and admin(uid):
+        ctx.user_data["await"]="session"; await q.edit_message_text("Send session file:")
+    elif q.data=="users" and admin(uid):
+        txt="\n".join(f"{u} | {d['role']} | blocked={d['blocked']}" for u,d in users.items())
         await q.edit_message_text(txt)
 
-async def text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    ensure(uid)
-    if blocked(uid): return
-    t = update.message.text.strip()
+async def text(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    uid=str(update.effective_user.id); ensure(uid)
+    if ctx.user_data.get("await")=="add":
+        users[uid]["accounts"].append(update.message.text.strip().replace("@",""))
+        save(); ctx.user_data.clear()
+        await update.message.reply_text("Added",reply_markup=menu(uid))
+    elif ctx.user_data.get("await")=="link":
+        ctx.user_data.clear()
+        await fetch_link(update.message.text.strip(),update.message.chat_id,ctx)
 
-    if ctx.user_data.get("await") == "add":
-        users[uid]["accounts"].append(t.replace("@",""))
-        save()
-        ctx.user_data["await"] = None
-        await update.message.reply_text("Added", reply_markup=menu(admin(uid), users[uid]["language"]))
-
-    elif ctx.user_data.get("await") == "link":
-        ctx.user_data["await"] = None
-        await fetch_link(t, update.message.chat_id, ctx)
-        await update.message.reply_text("Done", reply_markup=menu(admin(uid), users[uid]["language"]))
-
-async def receive_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
+async def receive_session(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
+    uid=str(update.effective_user.id)
     if not admin(uid): return
-    if ctx.user_data.get("await") != "session": return
+    if ctx.user_data.get("await")!="session": return
+    doc=update.message.document
+    if not doc: return
+    file=await doc.get_file()
+    await file.download_to_drive(SESSION)
+    L.load_session_from_file(filename=str(SESSION))
+    ctx.user_data.clear()
+    await update.message.reply_text("✅ Session loaded")
 
-    doc = update.message.document
-    if not doc:
-        await update.message.reply_text("❌ Please send a file")
-        return
-    if not doc.file_name.startswith("session-"):
-        await update.message.reply_text("❌ Invalid session file name")
-        return
-
-    file = await doc.get_file()
-    await file.download_to_drive(custom_path=str(SESSION))
-    try:
-        L.load_session_from_file(filename=str(SESSION))
-        ctx.user_data["await"] = None
-        await update.message.reply_text("✅ Instagram session loaded successfully")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to load session\n{e}")
-
-# ---------- Fetch functions ----------
-async def fetch_account(username, chat_id, ctx):
-    try: p = instaloader.Profile.from_username(L.context, username)
+# ---------- Fetch ----------
+async def fetch_account(username,chat_id,ctx):
+    # Posts/Reels
+    try: p=instaloader.Profile.from_username(L.context,username)
     except: return
+    last=state.get(username,{})
 
-    last = state.get(username, {})
-    # Posts
     for post in p.get_posts():
-        if last.get("post") and post.date_utc <= datetime.fromisoformat(last["post"]): break
-        L.download_post(post, target=username)
-        for r, _, f in os.walk(DOWNLOADS/username):
-            for x in f: await send_file(os.path.join(r,x), chat_id, ctx)
-        last["post"] = post.date_utc.isoformat()
-    # Stories (public fallback)
-    try:
-        stories = get_public_stories(username)
-        if stories:
-            for url in stories:
-                path = download_file(url, DOWNLOADS/username)
-                await send_file(path, chat_id, ctx)
-        else:
-            await ctx.bot.send_message(chat_id,"⚠️ No active public stories found")
-    except Exception as e:
-        await ctx.bot.send_message(chat_id,f"Error fetching stories: {e}")
+        if last.get("post") and post.date_utc<=datetime.fromisoformat(last["post"]): continue
+        L.download_post(post,target=username)
+        for r,_,f in os.walk(DOWNLOADS/username):
+            for x in f: await send_file(os.path.join(r,x),chat_id,ctx,caption=f"@{username}")
+        last["post"]=post.date_utc.isoformat()
+        break
+
     state[username]=last
     save()
+    # Stories
+    await fetch_story_sites(username,chat_id,ctx)
 
-async def fetch_link(url, chat_id, ctx):
-    d = DOWNLOADS / "link"; d.mkdir(exist_ok=True)
+async def fetch_link(url,chat_id,ctx):
     try:
         if "/p/" in url or "/reel/" in url:
-            c = url.rstrip("/").split("/")[-1]
-            L.download_post(instaloader.Post.from_shortcode(L.context, c), target="link")
+            c=url.rstrip("/").split("/")[-1]
+            L.download_post(instaloader.Post.from_shortcode(L.context,c),"link")
+            for r,_,f in os.walk(DOWNLOADS/"link"):
+                for x in f: await send_file(os.path.join(r,x),chat_id,ctx)
         elif "/stories/" in url:
-            u = url.split("/stories/")[1].split("/")[0]
-            stories = get_public_stories(u)
-            if not stories:
-                await ctx.bot.send_message(chat_id,"⚠️ No public stories found")
-                return
-            for s in stories:
-                path = download_file(s, d)
-                await send_file(path, chat_id, ctx)
-        else:
-            await ctx.bot.send_message(chat_id, "Unsupported link")
-            return
-
-        sent=False
-        for r,_,f in os.walk(d):
-            for x in f: await send_file(os.path.join(r,x), chat_id, ctx); sent=True
-        if not sent: await ctx.bot.send_message(chat_id,"Nothing downloaded")
+            u=url.split("/stories/")[1].split("/")[0]
+            await fetch_story_sites(u,chat_id,ctx)
     except Exception as e:
-        await ctx.bot.send_message(chat_id,f"Error: {e}")
-
-# ---------- Public Story Downloader ----------
-def get_public_stories(username):
-    try:
-        r = requests.get(f"https://storiesig.com/stories/{username}")
-        if r.status_code != 200: return []
-        data = r.json()  # فرض بر json response سایت
-        return [item["media_url"] for item in data.get("stories",[])]
-    except:
-        return []
-
-def download_file(url, folder):
-    folder.mkdir(exist_ok=True)
-    local = folder / url.split("/")[-1]
-    r = requests.get(url, stream=True)
-    with open(local, "wb") as f:
-        for chunk in r.iter_content(1024):
-            f.write(chunk)
-    return local
+        await ctx.bot.send_message(chat_id,str(e))
 
 # ---------- Main ----------
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
+    app=ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start",start))
     app.add_handler(CallbackQueryHandler(cb))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text))
-    app.add_handler(MessageHandler(filters.Document.ALL, receive_session))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text))
+    app.add_handler(MessageHandler(filters.Document.ALL,receive_session))
     app.run_polling()
 
-if __name__=="__main__":
-    main()
+if __name__=="__main__": main()
 PYCODE
 
-    # ---------- config.json ----------
-    cat <<EOF > config.json
+cat <<EOF > config.json
 {
-  "bot_token": "$BOT_TOKEN",
-  "admin_id": $ADMIN_ID
+  "bot_token":"$BOT_TOKEN",
+  "admin_id":$ADMIN_ID
 }
 EOF
 
-    python3 -m venv venv
-    source venv/bin/activate
-    pip install --upgrade pip
-    pip install python-telegram-bot==22.3 instaloader requests
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install python-telegram-bot==22.3 instaloader requests beautifulsoup4
 
-    # ---------- systemd service ----------
-    sudo tee /etc/systemd/system/$SERVICE.service > /dev/null <<EOF
+sudo tee /etc/systemd/system/$SERVICE.service >/dev/null <<EOF
 [Unit]
-Description=Telegram Instagram Bot
+Description=Instagram Bot
 After=network.target
-
 [Service]
 WorkingDirectory=$PROJECT
 ExecStart=$PROJECT/venv/bin/python telegram_instabot.py
 Restart=always
 RestartSec=5
-
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    sudo systemctl daemon-reload
-    sudo systemctl enable $SERVICE
-    sudo systemctl start $SERVICE
-
-    echo "✅ Bot installed and running"
+sudo systemctl daemon-reload
+sudo systemctl enable $SERVICE
+sudo systemctl start $SERVICE
+echo "✅ Bot Installed and Running"
 fi
 
 if [ "$C" == "2" ]; then
