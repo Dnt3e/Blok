@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-import os, json, asyncio
+import os, json
 from pathlib import Path
 from datetime import datetime
 import instaloader
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-# ---------- PATHS ----------
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters
+)
+
+# ================= PATHS =================
 BASE = Path(__file__).parent
 DOWNLOADS = BASE / "downloads"
 USERS_FILE = BASE / "users.json"
@@ -16,225 +20,223 @@ SESSION_FILE = BASE / "session"
 
 DOWNLOADS.mkdir(exist_ok=True)
 for f in [USERS_FILE, STATE_FILE]:
-    if not f.exists(): f.write_text("{}")
+    if not f.exists():
+        f.write_text("{}")
 
 CONFIG = json.loads(CONFIG_FILE.read_text())
 USERS = json.loads(USERS_FILE.read_text())
 STATE = json.loads(STATE_FILE.read_text())
 
-TOKEN = CONFIG["bot_token"]
-ADMIN_ID = CONFIG["admin_id"]
-CHECK_INTERVAL_HOURS = CONFIG.get("check_interval_hours", 3)
+BOT_TOKEN = CONFIG["bot_token"]
+ADMIN_ID = str(CONFIG["admin_id"])
 
-# ---------- INSTALOADER ----------
-L = instaloader.Instaloader(dirname_pattern=str(DOWNLOADS / "{target}"),
-                            save_metadata=False, download_comments=False)
+# ================= INSTALOADER =================
+L = instaloader.Instaloader(
+    save_metadata=False,
+    download_comments=False,
+    dirname_pattern=str(DOWNLOADS / "{target}")
+)
+
 if SESSION_FILE.exists():
-    try: L.load_session_from_file(filename=str(SESSION_FILE))
-    except: pass
+    try:
+        L.load_session_from_file(filename=str(SESSION_FILE))
+    except:
+        pass
 
-# ---------- HELPER FUNCTIONS ----------
+# ================= HELPERS =================
 def save():
     USERS_FILE.write_text(json.dumps(USERS, indent=2))
     STATE_FILE.write_text(json.dumps(STATE, indent=2))
 
+def is_admin(uid):
+    return USERS.get(uid, {}).get("role") == "admin"
+
+def is_blocked(uid):
+    return USERS.get(uid, {}).get("blocked", False)
+
+def all_files(path):
+    for root, _, files in os.walk(path):
+        for f in files:
+            yield os.path.join(root, f)
+
 async def send_and_delete(file, chat_id, context):
-    with open(file, "rb") as f: await context.bot.send_document(chat_id, f)
+    with open(file, "rb") as f:
+        await context.bot.send_document(chat_id, f)
     os.remove(file)
 
-# ---------- LANGUAGE ----------
-TEXT = {
-    "lang_select": "🌐 Choose language:",
-    "welcome_en": "👋 Welcome! Use the buttons below:",
-    "welcome_fa": "👋 خوش آمدی! از دکمه‌ها استفاده کن:",
-    "add_prompt_en": "Please send Instagram username to add:",
-    "add_prompt_fa": "لطفاً یوزرنیم اینستاگرام را بفرست:",
-    "added_en": "✔️ {} added successfully",
-    "added_fa": "✔️ {} اضافه شد",
-    "list_empty_en": "📋 Account list is empty",
-    "list_empty_fa": "📋 لیست اکانت‌ها خالی است",
-    "checking_en": "⏳ Checking Instagram...",
-    "checking_fa": "⏳ در حال بررسی...",
-    "done_en": "✅ Done!",
-    "done_fa": "✅ انجام شد!",
-    "login_prompt_en": "Please login to Instagram using /login username password",
-    "login_prompt_fa": "لطفاً برای ورود به اینستاگرام از دستور /login username password استفاده کنید",
-    "login_success_en": "🔑 Logged in successfully!",
-    "login_success_fa": "🔑 ورود با موفقیت انجام شد!",
-    "enter_link_en": "Please send Instagram post or story link:",
-    "enter_link_fa": "لطفاً لینک پست یا استوری اینستاگرام را ارسال کنید"
-}
+# ================= USER INIT =================
+def ensure_user(uid):
+    if uid not in USERS:
+        USERS[uid] = {"role": "user", "blocked": False}
+        if uid == ADMIN_ID:
+            USERS[uid]["role"] = "admin"
+        save()
 
-LANGUAGE = {}  # user_id -> 'en' or 'fa'
-LOGGED_IN = False
+# ================= KEYBOARD =================
+def main_menu(admin=False):
+    buttons = [
+        [InlineKeyboardButton("➕ Add Account", callback_data="add")],
+        [InlineKeyboardButton("⬇️ Check New Posts", callback_data="fetch")],
+        [InlineKeyboardButton("🔗 Download by Link", callback_data="link")]
+    ]
+    if admin:
+        buttons.append([InlineKeyboardButton("👥 Users", callback_data="users")])
+    return InlineKeyboardMarkup(buttons)
 
-# ---------- KEYBOARD ----------
-def get_keyboard(lang):
-    if lang=="fa":
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ افزودن اکانت", callback_data="add")],
-            [InlineKeyboardButton("📋 لیست اکانت‌ها", callback_data="list")],
-            [InlineKeyboardButton("⬇️ دانلود دستی", callback_data="fetch")],
-            [InlineKeyboardButton("🔗 دانلود لینک", callback_data="link")],
-            [InlineKeyboardButton("🔙 Back", callback_data="back")]
-        ])
-    else:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add Account", callback_data="add")],
-            [InlineKeyboardButton("📋 Account List", callback_data="list")],
-            [InlineKeyboardButton("⬇️ Manual Download", callback_data="fetch")],
-            [InlineKeyboardButton("🔗 Download by Link", callback_data="link")],
-            [InlineKeyboardButton("🔙 Back", callback_data="back")]
-        ])
-
-# ---------- BOT HANDLERS ----------
+# ================= COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid != ADMIN_ID: return
-    USERS.setdefault(str(uid), [])
-    save()
-    if uid not in LANGUAGE:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🇮🇷 فارسی", callback_data="lang_fa")],
-            [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")]
-        ])
-        await update.message.reply_text(TEXT["lang_select"], reply_markup=keyboard)
-    else:
-        lang = LANGUAGE[uid]
-        await update.message.reply_text(TEXT[f"welcome_{lang}"], reply_markup=get_keyboard(lang))
+    uid = str(update.effective_user.id)
+    ensure_user(uid)
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid != ADMIN_ID: return
-    lang = LANGUAGE.get(uid, "en")
-    text = "/start - start bot\n/login username password - login Instagram"
-    if lang=="fa":
-        text = "/start - شروع بات\n/login username password - ورود به اینستاگرام"
-    await update.message.reply_text(text)
+    if is_blocked(uid):
+        return
+
+    await update.message.reply_text(
+        "✅ Bot is ready",
+        reply_markup=main_menu(is_admin(uid))
+    )
 
 async def login_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global LOGGED_IN
-    uid = update.effective_user.id
-    if uid != ADMIN_ID: return
-    try:
-        username = context.args[0]
-        password = context.args[1]
-    except:
-        lang = LANGUAGE.get(uid, "en")
-        await update.message.reply_text(TEXT[f"login_prompt_{lang}"])
+    uid = str(update.effective_user.id)
+    if not is_admin(uid):
         return
-    try:
-        L.login(username, password)
-        L.save_session_to_file(SESSION_FILE)
-        LOGGED_IN = True
-        lang = LANGUAGE.get(uid, "en")
-        await update.message.reply_text(TEXT[f"login_success_{lang}"])
-    except Exception as e:
-        await update.message.reply_text(f"❌ Login failed: {e}")
 
-# ---------- CALLBACK MENU ----------
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        user, pwd = context.args
+        L.login(user, pwd)
+        L.save_session_to_file(SESSION_FILE)
+        await update.message.reply_text("✅ Instagram login successful")
+    except:
+        await update.message.reply_text("❌ Login failed")
+
+# ================= CALLBACKS =================
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    uid = q.from_user.id
-    if uid != ADMIN_ID: return
+    uid = str(q.from_user.id)
 
-    if q.data.startswith("lang_"):
-        lang = q.data.split("_")[1]
-        LANGUAGE[uid] = lang
-        await q.edit_message_text(TEXT[f"welcome_{lang}"], reply_markup=get_keyboard(lang))
+    if is_blocked(uid):
         return
 
-    lang = LANGUAGE.get(uid, "en")
-
-    if q.data=="add":
+    if q.data == "add":
         context.user_data["await"] = "add"
-        await q.edit_message_text(TEXT[f"add_prompt_{lang}"])
-    elif q.data=="list":
-        accs = USERS.get(str(uid), [])
-        text = "\n".join(accs) if accs else TEXT[f"list_empty_{lang}"]
-        await q.edit_message_text(text, reply_markup=get_keyboard(lang))
-    elif q.data=="fetch":
-        if not LOGGED_IN:
-            await q.edit_message_text(TEXT[f"login_prompt_{lang}"])
-            return
-        await q.edit_message_text(TEXT[f"checking_{lang}"])
-        for acc in USERS.get(str(uid), []):
-            await fetch_instagram(acc, uid, context)
-        await q.edit_message_text(TEXT[f"done_{lang}"], reply_markup=get_keyboard(lang))
-    elif q.data=="link":
-        context.user_data["await"] = "link"
-        await q.edit_message_text(TEXT[f"enter_link_{lang}"])
-    elif q.data=="back":
-        await q.edit_message_text(TEXT[f"welcome_{lang}"], reply_markup=get_keyboard(lang))
+        await q.edit_message_text("Send Instagram username:")
 
-# ---------- MESSAGE HANDLER ----------
-async def add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    elif q.data == "fetch":
+        await q.edit_message_text("⏳ Checking...")
+        for acc in USERS.get(uid, {}).get("accounts", []):
+            await fetch_account(acc, q.message.chat_id, context)
+        await q.edit_message_text("✅ Done", reply_markup=main_menu(is_admin(uid)))
+
+    elif q.data == "link":
+        context.user_data["await"] = "link"
+        await q.edit_message_text("Send Instagram link:")
+
+    elif q.data == "users" and is_admin(uid):
+        txt = "\n".join(
+            f"{u} | {d['role']} | blocked={d['blocked']}"
+            for u, d in USERS.items()
+        )
+        await q.edit_message_text(txt)
+
+# ================= TEXT HANDLER =================
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    if context.user_data.get("await")=="add":
-        acc = update.message.text.replace("@","").strip()
-        USERS.setdefault(uid,[]).append(acc)
+    ensure_user(uid)
+
+    if is_blocked(uid):
+        return
+
+    text = update.message.text.strip()
+
+    if context.user_data.get("await") == "add":
+        USERS[uid].setdefault("accounts", []).append(text.replace("@", ""))
         save()
         context.user_data["await"] = None
-        lang = LANGUAGE.get(int(uid),"en")
-        await update.message.reply_text(TEXT[f"added_{lang}"].format(acc), reply_markup=get_keyboard(lang))
-    elif context.user_data.get("await")=="link":
-        url = update.message.text.strip()
-        await fetch_by_link(url, int(uid), context)
-        context.user_data["await"] = None
-        lang = LANGUAGE.get(int(uid),"en")
-        await update.message.reply_text(TEXT[f"done_{lang}"], reply_markup=get_keyboard(lang))
+        await update.message.reply_text("✅ Account added", reply_markup=main_menu(is_admin(uid)))
 
-# ---------- FETCH FUNCTIONS ----------
-async def fetch_instagram(username, chat_id, context):
-    last = STATE.get(username, {"post": None,"story": None})
-    try: profile = instaloader.Profile.from_username(L.context, username)
-    except: return
-    # posts
+    elif context.user_data.get("await") == "link":
+        context.user_data["await"] = None
+        await fetch_by_link(text, update.message.chat_id, context)
+        await update.message.reply_text("✅ Done", reply_markup=main_menu(is_admin(uid)))
+
+# ================= FETCH ACCOUNT =================
+async def fetch_account(username, chat_id, context):
+    last = STATE.get(username, {"post": None, "story": None})
+    try:
+        profile = instaloader.Profile.from_username(L.context, username)
+    except:
+        return
+
     for post in profile.get_posts():
-        if last["post"] and post.date_utc <= datetime.fromisoformat(last["post"]): break
-        L.download_post(post,target=username)
-        for f in (DOWNLOADS/username).iterdir(): await send_and_delete(f,chat_id,context)
-        last["post"]=post.date_utc.isoformat()
-    # stories
+        if last["post"] and post.date_utc <= datetime.fromisoformat(last["post"]):
+            break
+        L.download_post(post, target=username)
+        for f in all_files(DOWNLOADS / username):
+            await send_and_delete(f, chat_id, context)
+        last["post"] = post.date_utc.isoformat()
+
     if L.context.is_logged_in:
         try:
-            for story in instaloader.get_stories([profile.userid],L.context):
-                for item in story.get_items():
-                    if last["story"] and item.date_utc <= datetime.fromisoformat(last["story"]): continue
-                    L.download_storyitem(item,target=username)
-                    for f in (DOWNLOADS/username).iterdir(): await send_and_delete(f,chat_id,context)
-                    last["story"]=item.date_utc.isoformat()
-        except: pass
-    STATE[username]=last
-    save()
-
-async def fetch_by_link(url, chat_id, context):
-    # download post/story from direct link
-    try:
-        post = instaloader.Post.from_shortcode(L.context, url.split("/")[-2])
-        L.download_post(post,target="link_download")
-        for f in (DOWNLOADS/"link_download").iterdir(): await send_and_delete(f,chat_id,context)
-    except:
-        try:
-            # try story
-            profile = instaloader.Profile.from_username(L.context, url.split("/")[3])
             for story in instaloader.get_stories([profile.userid], L.context):
                 for item in story.get_items():
-                    L.download_storyitem(item,target="link_download")
-                    for f in (DOWNLOADS/"link_download").iterdir(): await send_and_delete(f,chat_id,context)
-        except: pass
+                    if last["story"] and item.date_utc <= datetime.fromisoformat(last["story"]):
+                        continue
+                    L.download_storyitem(item, target=username)
+                    for f in all_files(DOWNLOADS / username):
+                        await send_and_delete(f, chat_id, context)
+                    last["story"] = item.date_utc.isoformat()
+        except:
+            pass
 
-# ---------- MAIN ----------
+    STATE[username] = last
+    save()
+
+# ================= FETCH LINK =================
+async def fetch_by_link(url, chat_id, context):
+    target = "link"
+    base = DOWNLOADS / target
+    base.mkdir(exist_ok=True)
+
+    try:
+        if "/p/" in url or "/reel/" in url:
+            code = url.rstrip("/").split("/")[-1]
+            post = instaloader.Post.from_shortcode(L.context, code)
+            L.download_post(post, target=target)
+
+        elif "/stories/" in url:
+            if not L.context.is_logged_in:
+                await context.bot.send_message(chat_id, "❌ Login required for stories")
+                return
+            username = url.split("/stories/")[1].split("/")[0]
+            profile = instaloader.Profile.from_username(L.context, username)
+            for story in instaloader.get_stories([profile.userid], L.context):
+                for item in story.get_items():
+                    L.download_storyitem(item, target=target)
+
+        else:
+            await context.bot.send_message(chat_id, "❌ Unsupported link")
+            return
+
+        sent = False
+        for f in all_files(base):
+            await send_and_delete(f, chat_id, context)
+            sent = True
+
+        if not sent:
+            await context.bot.send_message(chat_id, "⚠️ Nothing downloaded")
+
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"❌ Error: {e}")
+
+# ================= MAIN =================
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("login", login_instagram))
-    app.add_handler(CallbackQueryHandler(menu))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_account))
-    return app
-
-if __name__=="__main__":
-    app = main()
+    app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
