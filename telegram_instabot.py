@@ -2,7 +2,6 @@
 import os, json
 from pathlib import Path
 from datetime import datetime
-import asyncio
 import instaloader
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
@@ -44,7 +43,7 @@ async def send_and_delete(file, chat_id, context):
 
 # ---------- LANGUAGE ----------
 TEXT = {
-    "lang_select": "🌐 Choose language / انتخاب زبان:",
+    "lang_select": "🌐 Choose language:",
     "welcome_en": "👋 Welcome! Use the buttons below:",
     "welcome_fa": "👋 خوش آمدی! از دکمه‌ها استفاده کن:",
     "add_prompt_en": "Please send Instagram username to add:",
@@ -118,16 +117,13 @@ async def login_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(TEXT[f"login_prompt_{lang}"])
         return
     try:
-        L.context.log("Logging in...")
-        L.load_session_from_file(username)  # Try existing session first
-    except: pass
-    instaloader.Instaloader().context.log("Logging in...")
-    L.context.log("Logging in...")
-    L.login(username, password)
-    L.save_session_to_file(SESSION_FILE)
-    LOGGED_IN = True
-    lang = LANGUAGE.get(uid, "en")
-    await update.message.reply_text(TEXT[f"login_success_{lang}"])
+        L.login(username, password)
+        L.save_session_to_file(SESSION_FILE)
+        LOGGED_IN = True
+        lang = LANGUAGE.get(uid, "en")
+        await update.message.reply_text(TEXT[f"login_success_{lang}"])
+    except Exception as e:
+        await update.message.reply_text(f"❌ Login failed: {e}")
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -192,14 +188,16 @@ async def fetch_instagram(username, chat_id, context):
     save()
 
 # ---------- MAIN ----------
-async def main():
+def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("login", login_instagram))
     app.add_handler(CallbackQueryHandler(menu))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_account))
-    await app.run_polling()
+    return app
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # run polling without asyncio.run to avoid event loop errors
+    app = main()
+    app.run_polling()
