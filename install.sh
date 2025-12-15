@@ -1,44 +1,57 @@
 #!/bin/bash
 set -e
+
+PROJECT_NAME="Blok"
+SERVICE_NAME="insta_bot"
+BASE_DIR="$HOME/$PROJECT_NAME"
+
 echo "🚀 Telegram Instagram Bot Installer"
+echo "Project directory: $BASE_DIR"
+echo "-----------------------------------"
 
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip
-
-cd "$(dirname "$0")"
-
-# MENU
-echo "------- MENU -------"
 echo "1) Install"
 echo "2) Remove"
 echo "3) Start"
 echo "4) Restart"
 echo "5) Status"
-read -p "Choose an option (1-5): " CHOICE
+read -p "Choose option [1-5]: " OPTION
 
-if [ "$CHOICE" == "1" ]; then
-    read -p "🤖 Telegram Bot Token: " BOT_TOKEN
-    read -p "🆔 Telegram Admin ID: " ADMIN_ID
-    read -p "⏱ Auto check interval in hours [default 3]: " INTERVAL
-    INTERVAL=${INTERVAL:-3}
+# ================= INSTALL =================
+if [ "$OPTION" == "1" ]; then
+    read -p "Telegram Bot Token: " BOT_TOKEN
+    read -p "Telegram Admin ID: " ADMIN_ID
 
-    # Create config.json
+    sudo apt update
+    sudo apt install -y python3 python3-venv python3-pip
+
+    mkdir -p "$BASE_DIR"
+    cd "$BASE_DIR"
+
+    # ---------- create python files ----------
+    cat <<'EOF' > telegram_instabot.py
+<<PUT_TELEGRAM_INSTABOT_CODE_HERE>>
+EOF
+
+    # ---------- config ----------
     cat <<EOF > config.json
 {
   "bot_token": "$BOT_TOKEN",
-  "admin_id": $ADMIN_ID,
-  "check_interval_hours": $INTERVAL
+  "admin_id": $ADMIN_ID
 }
 EOF
 
-    # Create venv and install packages
+    echo "{}" > users.json
+    echo "{}" > state.json
+    mkdir -p downloads
+
+    # ---------- virtualenv ----------
     python3 -m venv venv
     source venv/bin/activate
     pip install --upgrade pip
     pip install python-telegram-bot==22.3 instaloader
 
-    # SYSTEMD
-    sudo tee /etc/systemd/system/insta_bot.service > /dev/null <<EOF
+    # ---------- systemd ----------
+    sudo tee /etc/systemd/system/$SERVICE_NAME.service > /dev/null <<EOF
 [Unit]
 Description=Telegram Instagram Bot
 After=network.target
@@ -46,51 +59,52 @@ After=network.target
 [Service]
 Type=simple
 User=$USER
-WorkingDirectory=$(pwd)
-ExecStart=$(pwd)/venv/bin/python telegram_instabot.py
+WorkingDirectory=$BASE_DIR
+ExecStart=$BASE_DIR/venv/bin/python telegram_instabot.py
 Restart=always
 RestartSec=5
-EOF
-
-    sudo tee /etc/systemd/system/insta_bot.timer > /dev/null <<EOF
-[Unit]
-Description=Instagram Auto Fetch Timer
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=${INTERVAL}h
-Persistent=true
 
 [Install]
-WantedBy=timers.target
+WantedBy=multi-user.target
 EOF
 
     sudo systemctl daemon-reload
-    sudo systemctl enable insta_bot insta_bot.timer
-    sudo systemctl start insta_bot insta_bot.timer
-    echo "✅ Bot installed and running"
+    sudo systemctl enable $SERVICE_NAME
+    sudo systemctl start $SERVICE_NAME
 
-elif [ "$CHOICE" == "2" ]; then
-    sudo systemctl stop insta_bot insta_bot.timer || true
-    sudo systemctl disable insta_bot insta_bot.timer || true
-    sudo rm -f /etc/systemd/system/insta_bot.service /etc/systemd/system/insta_bot.timer
-    sudo systemctl daemon-reload
-    rm -rf venv downloads config.json users.json state.json session
-    echo "🗑 Bot completely removed"
-
-elif [ "$CHOICE" == "3" ]; then
-    sudo systemctl start insta_bot
-    sudo systemctl start insta_bot.timer
-    echo "▶ Bot started"
-
-elif [ "$CHOICE" == "4" ]; then
-    sudo systemctl restart insta_bot
-    sudo systemctl restart insta_bot.timer
-    echo "🔄 Bot restarted"
-
-elif [ "$CHOICE" == "5" ]; then
-    sudo systemctl status insta_bot
-
-else
-    echo "❌ Invalid choice"
+    echo "✅ Installed and started successfully"
+    exit 0
 fi
+
+# ================= REMOVE =================
+if [ "$OPTION" == "2" ]; then
+    sudo systemctl stop $SERVICE_NAME || true
+    sudo systemctl disable $SERVICE_NAME || true
+    sudo rm -f /etc/systemd/system/$SERVICE_NAME.service
+    sudo systemctl daemon-reload
+    rm -rf "$BASE_DIR"
+    echo "🗑 Bot completely removed"
+    exit 0
+fi
+
+# ================= START =================
+if [ "$OPTION" == "3" ]; then
+    sudo systemctl start $SERVICE_NAME
+    echo "▶ Bot started"
+    exit 0
+fi
+
+# ================= RESTART =================
+if [ "$OPTION" == "4" ]; then
+    sudo systemctl restart $SERVICE_NAME
+    echo "🔄 Bot restarted"
+    exit 0
+fi
+
+# ================= STATUS =================
+if [ "$OPTION" == "5" ]; then
+    sudo systemctl status $SERVICE_NAME
+    exit 0
+fi
+
+echo "❌ Invalid option"
